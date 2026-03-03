@@ -32,7 +32,8 @@ import {
   Mic,
   MicOff,
   Square,
-  ScissorsLineDashed
+  ScissorsLineDashed,
+  Layers
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
@@ -40,6 +41,54 @@ import { readStoredUser, persistUser, clearUser, sendMagicLink, verifyMagicToken
 
 const PORTFOLIO_API = 'https://audio-portfolio-worker.torarnehave.workers.dev';
 const UPLOAD_API = 'https://norwegian-transcription-worker.torarnehave.workers.dev';
+
+/** Mix two AudioBuffers together with per-track volume. Returns a new AudioBuffer. */
+function mixTwoBuffers(
+  audioCtx: AudioContext,
+  buf1: AudioBuffer,
+  buf2: AudioBuffer,
+  vol1: number,
+  vol2: number
+): AudioBuffer {
+  const sampleRate = buf1.sampleRate;
+  const channels = Math.max(buf1.numberOfChannels, buf2.numberOfChannels);
+
+  // Resample buf2 if needed
+  let buf2Length = buf2.length;
+  if (buf2.sampleRate !== sampleRate) {
+    buf2Length = Math.round(buf2.length * sampleRate / buf2.sampleRate);
+  }
+
+  const outLength = Math.max(buf1.length, buf2Length);
+  const mixed = audioCtx.createBuffer(channels, outLength, sampleRate);
+
+  for (let ch = 0; ch < channels; ch++) {
+    const out = mixed.getChannelData(ch);
+    const ch1 = ch < buf1.numberOfChannels ? buf1.getChannelData(ch) : buf1.getChannelData(0);
+    const ch2 = ch < buf2.numberOfChannels ? buf2.getChannelData(ch) : buf2.getChannelData(0);
+    const ratio = buf2.sampleRate !== sampleRate ? buf2.sampleRate / sampleRate : 1;
+
+    for (let i = 0; i < outLength; i++) {
+      let s1 = i < buf1.length ? ch1[i] * vol1 : 0;
+      let s2 = 0;
+      if (ratio === 1 && i < buf2.length) {
+        s2 = ch2[i] * vol2;
+      } else if (ratio !== 1) {
+        const srcIdx = i * ratio;
+        const idx = Math.floor(srcIdx);
+        if (idx < buf2.length) {
+          const frac = srcIdx - idx;
+          const a = ch2[idx];
+          const b = idx + 1 < buf2.length ? ch2[idx + 1] : a;
+          s2 = (a + frac * (b - a)) * vol2;
+        }
+      }
+      out[i] = Math.max(-1, Math.min(1, s1 + s2));
+    }
+  }
+
+  return mixed;
+}
 
 interface PortfolioRecording {
   id: string;
@@ -560,6 +609,14 @@ export default function App() {
   const [clipName, setClipName] = useState('');
   const [clipCategory, setClipCategory] = useState('clip');
 
+  // Track 2 (overlay) state
+  const waveformRef2 = useRef<HTMLDivElement>(null);
+  const wavesurfer2 = useRef<WaveSurfer | null>(null);
+  const [track2Url, setTrack2Url] = useState<string | null>(null);
+  const [track2Volume, setTrack2Volume] = useState(1);
+  const [track2Muted, setTrack2Muted] = useState(false);
+  const [track2Loading, setTrack2Loading] = useState(false);
+
   // Bootstrap auth from localStorage + handle magic token in URL
   useEffect(() => {
     const stored = readStoredUser();
@@ -702,11 +759,12 @@ export default function App() {
   };
 
   const openSaveDialog = () => {
-    const defaultName = loadedRecordingName
-      ? `Clip of ${loadedRecordingName}`
-      : `Clip ${Math.floor(activeRegion?.start ?? 0)}s-${Math.floor(activeRegion?.end ?? 0)}s`;
+    const isClip = !!activeRegion;
+    const defaultName = isClip
+      ? (loadedRecordingName ? `Clip of ${loadedRecordingName}` : `Clip ${Math.floor(activeRegion.start)}s-${Math.floor(activeRegion.end)}s`)
+      : (loadedRecordingName || 'Untitled Recording');
     setClipName(defaultName);
-    setClipCategory('clip');
+    setClipCategory(isClip ? 'clip' : 'recording');
     setShowSaveDialog(true);
   };
 
@@ -757,7 +815,13 @@ export default function App() {
     ws.on('play', () => setIsPlaying(true));
     ws.on('pause', () => setIsPlaying(false));
     ws.on('timeupdate', (time) => setCurrentTime(time));
-    
+    ws.on('seeking', (time) => {
+      // Sync Track 2 position when user seeks on Track 1
+      if (wavesurfer2.current) {
+        wavesurfer2.current.setTime(time);
+      }
+    });
+
     ws.on('error', (err) => {
       console.error('WaveSurfer error:', err);
       setError('Failed to load audio. Please check the URL or file format.');
@@ -766,6 +830,50 @@ export default function App() {
 
     wavesurfer.current = ws;
   }, []);
+
+  const initWaveSurfer2 = useCallback((url: string) => {
+    if (!waveformRef2.current) return;
+
+    if (wavesurfer2.current) {
+      wavesurfer2.current.destroy();
+    }
+
+    setTrack2Loading(true);
+
+    const ws2 = WaveSurfer.create({
+      container: waveformRef2.current,
+      waveColor: '#059669',
+      progressColor: '#34d399',
+      cursorColor: '#064e3b',
+      barWidth: 2,
+      barRadius: 3,
+      height: 80,
+      normalize: true,
+      url: url,
+      minPxPerSec: 10,
+      autoCenter: true,
+    });
+
+    ws2.on('ready', () => {
+      setTrack2Loading(false);
+      // Sync zoom with Track 1
+      ws2.zoom(zoom);
+    });
+
+    ws2.on('seeking', (time) => {
+      // Sync Track 1 position when user seeks on Track 2
+      if (wavesurfer.current) {
+        wavesurfer.current.setTime(time);
+      }
+    });
+
+    ws2.on('error', (err) => {
+      console.error('WaveSurfer Track 2 error:', err);
+      setTrack2Loading(false);
+    });
+
+    wavesurfer2.current = ws2;
+  }, [zoom]);
 
   const handleUrlSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -784,18 +892,52 @@ export default function App() {
     }
   };
 
+  const handleTrack2FileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = URL.createObjectURL(file);
+      setTrack2Url(url);
+      initWaveSurfer2(url);
+    }
+  };
+
+  const removeTrack2 = () => {
+    if (wavesurfer2.current) {
+      wavesurfer2.current.destroy();
+      wavesurfer2.current = null;
+    }
+    setTrack2Url(null);
+    setTrack2Volume(1);
+    setTrack2Muted(false);
+  };
+
   const togglePlay = () => {
     if (!wavesurfer.current) return;
-    
+
     if (currentRegionRef.current && !isPlaying) {
       currentRegionRef.current.play();
+      // Also play Track 2 from region start
+      if (wavesurfer2.current) {
+        wavesurfer2.current.setTime(currentRegionRef.current.start);
+        wavesurfer2.current.play();
+      }
     } else {
       wavesurfer.current.playPause();
+      // Sync Track 2
+      if (wavesurfer2.current) {
+        if (wavesurfer.current.isPlaying()) {
+          // Track 1 just started playing, so play Track 2 too
+          wavesurfer2.current.play();
+        } else {
+          wavesurfer2.current.pause();
+        }
+      }
     }
   };
 
   const stopAudio = () => {
     wavesurfer.current?.stop();
+    wavesurfer2.current?.stop();
   };
 
   const toggleMute = () => {
@@ -812,10 +954,25 @@ export default function App() {
     wavesurfer.current?.setVolume(val);
   };
 
+  const handleTrack2VolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setTrack2Volume(val);
+    wavesurfer2.current?.setVolume(val);
+  };
+
+  const toggleTrack2Mute = () => {
+    if (wavesurfer2.current) {
+      const newMute = !track2Muted;
+      setTrack2Muted(newMute);
+      wavesurfer2.current.setMuted(newMute);
+    }
+  };
+
   const handleZoomChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(e.target.value);
     setZoom(val);
     wavesurfer.current?.zoom(val);
+    wavesurfer2.current?.zoom(val);
   };
 
   const addRegion = () => {
@@ -916,38 +1073,63 @@ export default function App() {
 
     try {
       setIsExporting(true);
-      
-      // 1. Fetch the audio data
+
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+      // Decode Track 1
       const response = await fetch(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
-      
-      // 2. Decode the audio
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      
-      // 3. Extract the segment
+
+      // Extract the clip segment from Track 1
       const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
       const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
       const frameCount = endSample - startSample;
-      
-      const newBuffer = audioCtx.createBuffer(
+
+      const clipBuffer = audioCtx.createBuffer(
         audioBuffer.numberOfChannels,
         frameCount,
         audioBuffer.sampleRate
       );
-      
+
       for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
         const channelData = audioBuffer.getChannelData(i);
-        const newChannelData = newBuffer.getChannelData(i);
+        const newChannelData = clipBuffer.getChannelData(i);
         for (let j = 0; j < frameCount; j++) {
           newChannelData[j] = channelData[startSample + j];
         }
       }
-      
-      // 4. Encode to WAV
-      const wavBlob = audioBufferToWav(newBuffer);
-      
-      // 5. Trigger download
+
+      let finalBuffer = clipBuffer;
+
+      // Mix with Track 2 if loaded
+      if (track2Url) {
+        const res2 = await fetch(track2Url);
+        const ab2 = await res2.arrayBuffer();
+        const buf2Full = await audioCtx.decodeAudioData(ab2);
+
+        // Extract same time range from Track 2
+        const sr2 = buf2Full.sampleRate;
+        const start2 = Math.floor(activeRegion.start * sr2);
+        const end2 = Math.min(Math.floor(activeRegion.end * sr2), buf2Full.length);
+        const len2 = Math.max(0, end2 - start2);
+
+        if (len2 > 0) {
+          const clip2 = audioCtx.createBuffer(buf2Full.numberOfChannels, len2, sr2);
+          for (let ch = 0; ch < buf2Full.numberOfChannels; ch++) {
+            const src = buf2Full.getChannelData(ch);
+            const dst = clip2.getChannelData(ch);
+            for (let j = 0; j < len2; j++) {
+              dst[j] = src[start2 + j];
+            }
+          }
+          finalBuffer = mixTwoBuffers(audioCtx, clipBuffer, clip2, volume, track2Volume);
+        }
+      }
+
+      audioCtx.close();
+      const wavBlob = audioBufferToWav(finalBuffer);
+
       const url = URL.createObjectURL(wavBlob);
       const link = document.createElement('a');
       link.href = url;
@@ -956,7 +1138,7 @@ export default function App() {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      
+
       setIsExporting(false);
     } catch (err) {
       console.error('Export error:', err);
@@ -1028,33 +1210,73 @@ export default function App() {
   };
 
   const saveClipToPortfolio = async () => {
-    if (!activeRegion || !audioUrl || !wavesurfer.current || !authUser) return;
+    if (!audioUrl || !wavesurfer.current || !authUser) return;
 
     try {
       setIsSaving(true);
       setSaveMessage(null);
 
-      // 1. Extract clip (same logic as downloadClip)
       const response = await fetch(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
-      const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
-      const frameCount = endSample - startSample;
-      const newBuffer = audioCtx.createBuffer(audioBuffer.numberOfChannels, frameCount, audioBuffer.sampleRate);
-      for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
-        const channelData = audioBuffer.getChannelData(i);
-        const newChannelData = newBuffer.getChannelData(i);
-        for (let j = 0; j < frameCount; j++) {
-          newChannelData[j] = channelData[startSample + j];
-        }
+
+      // Optionally decode Track 2 for mixing
+      let track2Buffer: AudioBuffer | null = null;
+      if (track2Url) {
+        const res2 = await fetch(track2Url);
+        const ab2 = await res2.arrayBuffer();
+        track2Buffer = await audioCtx.decodeAudioData(ab2);
       }
-      const wavBlob = audioBufferToWav(newBuffer);
+
+      let wavBlob: Blob;
+      let saveDuration: number;
+
+      if (activeRegion) {
+        // Extract clip from selected region
+        const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
+        const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
+        const frameCount = endSample - startSample;
+        const clipBuf = audioCtx.createBuffer(audioBuffer.numberOfChannels, frameCount, audioBuffer.sampleRate);
+        for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
+          const channelData = audioBuffer.getChannelData(i);
+          const newChannelData = clipBuf.getChannelData(i);
+          for (let j = 0; j < frameCount; j++) {
+            newChannelData[j] = channelData[startSample + j];
+          }
+        }
+
+        let finalBuf = clipBuf;
+        if (track2Buffer) {
+          const sr2 = track2Buffer.sampleRate;
+          const s2 = Math.floor(activeRegion.start * sr2);
+          const e2 = Math.min(Math.floor(activeRegion.end * sr2), track2Buffer.length);
+          const len2 = Math.max(0, e2 - s2);
+          if (len2 > 0) {
+            const clip2 = audioCtx.createBuffer(track2Buffer.numberOfChannels, len2, sr2);
+            for (let ch = 0; ch < track2Buffer.numberOfChannels; ch++) {
+              const src = track2Buffer.getChannelData(ch);
+              const dst = clip2.getChannelData(ch);
+              for (let j = 0; j < len2; j++) dst[j] = src[s2 + j];
+            }
+            finalBuf = mixTwoBuffers(audioCtx, clipBuf, clip2, volume, track2Volume);
+          }
+        }
+
+        wavBlob = audioBufferToWav(finalBuf);
+        saveDuration = activeRegion.end - activeRegion.start;
+      } else {
+        // Save full audio (mixed if Track 2 present)
+        const finalBuf = track2Buffer
+          ? mixTwoBuffers(audioCtx, audioBuffer, track2Buffer, volume, track2Volume)
+          : audioBuffer;
+        wavBlob = audioBufferToWav(finalBuf);
+        saveDuration = finalBuf.duration;
+      }
       audioCtx.close();
 
-      // 2. Upload WAV to R2 (raw blob + X-File-Name header, same as AudioClipModal)
-      const fileName = `clip-${Date.now()}.wav`;
+      // Upload WAV to R2
+      const fileName = `${activeRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
       const uploadRes = await fetch(`${UPLOAD_API}/upload`, {
         method: 'POST',
         headers: { 'X-File-Name': encodeURIComponent(fileName) },
@@ -1063,21 +1285,21 @@ export default function App() {
       if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
       const { r2Key, audioUrl: r2Url } = await uploadRes.json();
 
-      // 3. Save metadata to portfolio (same format as AudioClipModal)
-      const clipDuration = activeRegion.end - activeRegion.start;
-      const tags = ['clip', 'audio-studio'];
-      if (loadedRecordingId) tags.push(`clipped-from:${loadedRecordingId}`);
+      // Save metadata to portfolio
+      const tags = [activeRegion ? 'clip' : 'full-audio', 'audio-studio'];
+      if (track2Url) tags.push('mixed-2-tracks');
+      if (loadedRecordingId) tags.push(`${activeRegion ? 'clipped' : 'saved'}-from:${loadedRecordingId}`);
 
       const recordingData = {
         userEmail: authUser.email,
         fileName,
-        displayName: clipName || `Clip of ${loadedRecordingName || 'Untitled'}`,
+        displayName: clipName || (activeRegion ? `Clip of ${loadedRecordingName || 'Untitled'}` : loadedRecordingName || 'Untitled'),
         fileSize: wavBlob.size,
-        duration: Math.round(clipDuration),
+        duration: Math.round(saveDuration),
         r2Key,
         r2Url,
         transcriptionText: '',
-        category: clipCategory || 'clip',
+        category: clipCategory || (activeRegion ? 'clip' : 'recording'),
         tags,
         audioFormat: 'wav',
         aiService: 'none',
@@ -1096,11 +1318,11 @@ export default function App() {
       if (!metaRes.ok) throw new Error(`Save failed: ${metaRes.status}`);
 
       setShowSaveDialog(false);
-      setSaveMessage('Clip saved to portfolio!');
+      setSaveMessage(activeRegion ? 'Clip saved to portfolio!' : 'Audio saved to portfolio!');
       setTimeout(() => setSaveMessage(null), 3000);
     } catch (err) {
       console.error('Save to portfolio error:', err);
-      setSaveMessage(`Error: ${err instanceof Error ? err.message : 'Failed to save clip'}`);
+      setSaveMessage(`Error: ${err instanceof Error ? err.message : 'Failed to save'}`);
       setTimeout(() => setSaveMessage(null), 5000);
     } finally {
       setIsSaving(false);
@@ -1212,10 +1434,10 @@ export default function App() {
                 className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md"
                 onClick={(e) => e.stopPropagation()}
               >
-                <h3 className="text-lg font-bold mb-4">Save Clip to Portfolio</h3>
+                <h3 className="text-lg font-bold mb-4">Save {activeRegion ? 'Clip' : 'Audio'} to Portfolio</h3>
                 <div className="space-y-3 mb-5">
                   <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Clip Name</label>
+                    <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Name</label>
                     <input
                       type="text"
                       value={clipName}
@@ -1234,9 +1456,13 @@ export default function App() {
                       placeholder="e.g. clip, podcast, music"
                     />
                   </div>
-                  {activeRegion && (
+                  {activeRegion ? (
                     <p className="text-xs text-zinc-400">
                       Region: {Math.floor(activeRegion.start / 60)}:{(activeRegion.start % 60).toFixed(1).padStart(4, '0')} &ndash; {Math.floor(activeRegion.end / 60)}:{(activeRegion.end % 60).toFixed(1).padStart(4, '0')} ({(activeRegion.end - activeRegion.start).toFixed(1)}s)
+                    </p>
+                  ) : (
+                    <p className="text-xs text-zinc-400">
+                      Full audio &mdash; {Math.floor(duration / 60)}:{(duration % 60).toFixed(1).padStart(4, '0')} ({duration.toFixed(1)}s)
                     </p>
                   )}
                 </div>
@@ -1324,7 +1550,7 @@ export default function App() {
 
           {/* Waveform Section */}
           <section className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm min-h-[300px] flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2 text-zinc-400">
                 <FileAudio size={18} />
                 <span className="text-xs font-semibold uppercase tracking-wider">Waveform Visualization</span>
@@ -1336,6 +1562,7 @@ export default function App() {
               )}
             </div>
 
+            {/* Track 1 (Main) */}
             <div className="flex-1 flex flex-col justify-center relative">
               {!audioUrl && !isLoading && (
                 <div className="text-center py-12">
@@ -1361,23 +1588,98 @@ export default function App() {
                 </div>
               )}
 
+              {/* Track 1 header with per-track volume */}
+              {audioUrl && (
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold uppercase tracking-wider text-indigo-500">Track 1 — Main</span>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={toggleMute} className="text-zinc-400 hover:text-zinc-600 transition-colors" title="Mute/unmute Track 1">
+                      {isMuted || volume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}
+                    </button>
+                    <input
+                      type="range" min="0" max="1" step="0.01" value={volume}
+                      onChange={handleVolumeChange}
+                      title="Track 1 volume"
+                      className="w-24 h-1 bg-zinc-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                    />
+                  </div>
+                </div>
+              )}
+
               <div ref={waveformRef} className="w-full min-h-[148px] rounded-lg overflow-hidden border border-zinc-100 bg-zinc-50/50" />
             </div>
 
+            {/* Track 2 (Overlay) */}
+            {audioUrl && (
+              <div className="mt-4">
+                {!track2Url ? (
+                  <label className="flex items-center justify-center w-full h-10 px-4 bg-emerald-50 border-2 border-dashed border-emerald-200 rounded-lg cursor-pointer hover:border-emerald-400 hover:bg-emerald-100/50 transition-all group">
+                    <div className="flex items-center gap-2 text-emerald-500 group-hover:text-emerald-700">
+                      <Layers size={16} />
+                      <span className="text-xs font-medium">Add Overlay Track</span>
+                    </div>
+                    <input type="file" className="hidden" accept="audio/*" onChange={handleTrack2FileUpload} />
+                  </label>
+                ) : (
+                  <div className="relative">
+                    {/* Track 2 header */}
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold uppercase tracking-wider text-emerald-600">Track 2 — Overlay</span>
+                      <div className="flex items-center gap-2">
+                        <label className="flex items-center gap-1 px-2 py-1 text-emerald-500 hover:text-emerald-700 hover:bg-emerald-50 rounded cursor-pointer transition-colors" title="Replace overlay audio">
+                          <Upload size={14} />
+                          <input type="file" className="hidden" accept="audio/*" onChange={handleTrack2FileUpload} title="Replace overlay audio file" />
+                        </label>
+                        <button type="button" onClick={toggleTrack2Mute} className="text-zinc-400 hover:text-zinc-600 transition-colors" title="Mute/unmute Track 2">
+                          {track2Muted || track2Volume === 0 ? <VolumeX size={16} /> : <Volume2 size={16} />}
+                        </button>
+                        <input
+                          type="range" min="0" max="1" step="0.01" value={track2Volume}
+                          onChange={handleTrack2VolumeChange}
+                          title="Track 2 volume"
+                          className="w-24 h-1 bg-zinc-200 rounded-lg appearance-none cursor-pointer accent-emerald-600"
+                        />
+                        <button
+                          type="button"
+                          onClick={removeTrack2}
+                          className="w-6 h-6 flex items-center justify-center text-zinc-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                          title="Remove overlay track"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {track2Loading && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10 rounded-lg">
+                        <Loader2 size={20} className="animate-spin text-emerald-500" />
+                      </div>
+                    )}
+
+                    <div ref={waveformRef2} className="w-full min-h-[100px] rounded-lg overflow-hidden border border-emerald-100 bg-emerald-50/30" />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Controls */}
             {audioUrl && (
-              <div className="mt-8 pt-6 border-t border-zinc-100 flex flex-wrap items-center justify-between gap-6">
+              <div className="mt-6 pt-6 border-t border-zinc-100 flex flex-wrap items-center justify-between gap-6">
                 {/* Playback Controls */}
                 <div className="flex items-center gap-3">
-                  <button 
+                  <button
+                    type="button"
                     onClick={togglePlay}
                     className="w-12 h-12 bg-indigo-600 text-white rounded-full flex items-center justify-center hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all active:scale-95"
+                    title={isPlaying ? 'Pause' : 'Play'}
                   >
                     {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} className="ml-1" fill="currentColor" />}
                   </button>
-                  <button 
+                  <button
+                    type="button"
                     onClick={stopAudio}
                     className="w-10 h-10 bg-zinc-100 text-zinc-600 rounded-full flex items-center justify-center hover:bg-zinc-200 transition-all"
+                    title="Stop and reset"
                   >
                     <RotateCcw size={20} />
                   </button>
@@ -1401,39 +1703,34 @@ export default function App() {
                     onClear={clearRegion}
                     onAdd={addRegion}
                   />
+                  {/* Save full audio to portfolio (shown when no clip region is active) */}
+                  {authStatus === 'authed' && !activeRegion && (
+                    <button
+                      type="button"
+                      onClick={openSaveDialog}
+                      disabled={isSaving}
+                      className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                      title="Save full audio to your Vegvisr audio portfolio"
+                    >
+                      {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                      {isSaving ? 'Saving...' : 'Save to Portfolio'}
+                    </button>
+                  )}
                 </div>
 
-                {/* Volume & Zoom Controls */}
-                <div className="flex flex-col gap-4 min-w-[200px]">
-                  {/* Zoom Slider */}
-                  <div className="flex items-center gap-3">
-                    <ZoomIn size={18} className="text-zinc-400" />
-                    <input 
-                      type="range" 
-                      min="10" 
-                      max="500" 
-                      step="1" 
-                      value={zoom}
-                      onChange={handleZoomChange}
-                      className="flex-1 h-1.5 bg-zinc-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-                    />
-                  </div>
-                  
-                  {/* Volume Slider */}
-                  <div className="flex items-center gap-3">
-                    <button onClick={toggleMute} className="text-zinc-400 hover:text-zinc-600 transition-colors">
-                      {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
-                    </button>
-                    <input 
-                      type="range" 
-                      min="0" 
-                      max="1" 
-                      step="0.01" 
-                      value={volume}
-                      onChange={handleVolumeChange}
-                      className="flex-1 h-1.5 bg-zinc-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-                    />
-                  </div>
+                {/* Zoom Control */}
+                <div className="flex items-center gap-3 min-w-[200px]">
+                  <ZoomIn size={18} className="text-zinc-400" />
+                  <input
+                    type="range"
+                    min="10"
+                    max="500"
+                    step="1"
+                    value={zoom}
+                    onChange={handleZoomChange}
+                    title="Zoom level"
+                    className="flex-1 h-1.5 bg-zinc-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                  />
                 </div>
               </div>
             )}
