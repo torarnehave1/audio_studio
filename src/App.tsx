@@ -7,33 +7,169 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.js';
 import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.js';
-import { 
-  Play, 
-  Pause, 
-  Scissors, 
-  Download, 
-  Upload, 
-  Link as LinkIcon, 
-  Volume2, 
+import {
+  Play,
+  Pause,
+  Scissors,
+  Download,
+  Upload,
+  Link as LinkIcon,
+  Volume2,
   VolumeX,
   RotateCcw,
   Trash2,
   Music,
   FileAudio,
   Loader2,
-  ZoomIn
+  ZoomIn,
+  LogIn,
+  LogOut,
+  FolderOpen,
+  Save,
+  X,
+  Search,
+  ChevronRight
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
+import { readStoredUser, persistUser, clearUser, sendMagicLink, verifyMagicToken, type AuthUser, type AuthStatus } from './lib/auth';
+
+const PORTFOLIO_API = 'https://audio-portfolio-worker.torarnehave.workers.dev';
+const UPLOAD_API = 'https://norwegian-transcription-worker.torarnehave.workers.dev';
+
+interface PortfolioRecording {
+  id: string;
+  displayName: string;
+  duration: number;
+  category: string;
+  createdAt: string;
+  audioUrl?: string;
+  r2Key?: string;
+  tags?: string[];
+}
+
+/* ── Portfolio Browser Panel ── */
+const PortfolioBrowser = ({ email, onSelect, onClose }: {
+  email: string;
+  onSelect: (rec: PortfolioRecording) => void;
+  onClose: () => void;
+}) => {
+  const [recordings, setRecordings] = useState<PortfolioRecording[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const fetchRecordings = async () => {
+      try {
+        setLoading(true);
+        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}`);
+        if (!res.ok) throw new Error('Failed to fetch recordings');
+        const data = await res.json();
+        setRecordings(data.recordings || []);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load portfolio');
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchRecordings();
+  }, [email]);
+
+  const filtered = recordings.filter(r =>
+    r.displayName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    r.category?.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  const formatDuration = (sec: number) => {
+    if (!sec) return '--:--';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -10 }}
+      className="bg-white border border-zinc-200 rounded-2xl shadow-lg p-5"
+    >
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-2">
+          <FolderOpen size={16} className="text-indigo-500" />
+          My Portfolio Recordings
+        </h3>
+        <button onClick={onClose} className="text-zinc-400 hover:text-zinc-600 transition-colors" title="Close portfolio">
+          <X size={18} />
+        </button>
+      </div>
+
+      <div className="relative mb-3">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={16} />
+        <input
+          type="text"
+          placeholder="Search recordings..."
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          className="w-full pl-9 pr-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+        />
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center py-8">
+          <Loader2 size={20} className="animate-spin text-indigo-500" />
+          <span className="ml-2 text-sm text-zinc-500">Loading recordings...</span>
+        </div>
+      )}
+
+      {error && (
+        <div className="text-center py-6 text-red-500 text-sm">{error}</div>
+      )}
+
+      {!loading && !error && filtered.length === 0 && (
+        <div className="text-center py-6 text-zinc-400 text-sm">
+          {recordings.length === 0 ? 'No recordings in your portfolio yet.' : 'No recordings match your search.'}
+        </div>
+      )}
+
+      {!loading && !error && filtered.length > 0 && (
+        <div className="max-h-64 overflow-y-auto space-y-1">
+          {filtered.map((rec) => (
+            <button
+              key={rec.id}
+              onClick={() => onSelect(rec)}
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-indigo-50 transition-colors text-left group"
+            >
+              <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 group-hover:bg-indigo-200 transition-colors">
+                <Music size={14} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-zinc-800 truncate">{rec.displayName || rec.id}</p>
+                <p className="text-xs text-zinc-400">
+                  {rec.category || 'Uncategorized'} &middot; {formatDuration(rec.duration)} &middot; {new Date(rec.createdAt).toLocaleDateString()}
+                </p>
+              </div>
+              <ChevronRight size={16} className="text-zinc-300 group-hover:text-indigo-400 transition-colors" />
+            </button>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
+};
 
 interface ClippingControlsProps {
   activeRegion: { start: number; end: number } | null;
   duration: number;
   isExporting: boolean;
+  isSaving: boolean;
   isPlaying: boolean;
+  isLoggedIn: boolean;
   onPlayRegion: () => void;
   onManualChange: (type: 'start' | 'end', value: string) => void;
   onDownload: () => void;
+  onSaveToPortfolio: () => void;
   onClear: () => void;
   onAdd: () => void;
 }
@@ -76,16 +212,19 @@ const TimeInput = ({ value, onChange, label, max }: { value: number, onChange: (
   );
 };
 
-const ClippingControls = React.memo(({ 
-  activeRegion, 
-  duration, 
-  isExporting, 
+const ClippingControls = React.memo(({
+  activeRegion,
+  duration,
+  isExporting,
+  isSaving,
   isPlaying,
+  isLoggedIn,
   onPlayRegion,
-  onManualChange, 
-  onDownload, 
-  onClear, 
-  onAdd 
+  onManualChange,
+  onDownload,
+  onSaveToPortfolio,
+  onClear,
+  onAdd
 }: ClippingControlsProps) => {
   if (!activeRegion) {
     return (
@@ -123,7 +262,7 @@ const ClippingControls = React.memo(({
       >
         {isPlaying ? <Pause size={18} /> : <Play size={18} />}
       </button>
-      <button 
+      <button
         onClick={onDownload}
         disabled={isExporting}
         className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
@@ -131,9 +270,21 @@ const ClippingControls = React.memo(({
         {isExporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
         {isExporting ? 'Exporting...' : 'Export Clip'}
       </button>
-      <button 
+      {isLoggedIn && (
+        <button
+          onClick={onSaveToPortfolio}
+          disabled={isSaving}
+          className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Save clip to your Vegvisr audio portfolio"
+        >
+          {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+          {isSaving ? 'Saving...' : 'Save to Portfolio'}
+        </button>
+      )}
+      <button
         onClick={onClear}
         className="w-9 h-9 flex items-center justify-center text-zinc-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+        title="Clear region"
       >
         <Trash2 size={18} />
       </button>
@@ -146,7 +297,7 @@ export default function App() {
   const wavesurfer = useRef<WaveSurfer | null>(null);
   const regions = useRef<any>(null);
   const currentRegionRef = useRef<any>(null);
-  
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1);
@@ -157,8 +308,82 @@ export default function App() {
   const [inputUrl, setInputUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeRegion, setActiveRegion] = useState<{ start: number; end: number } | null>(null);
+
+  // Auth state
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authStatus, setAuthStatus] = useState<AuthStatus>('checking');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginMessage, setLoginMessage] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  // Portfolio state
+  const [showPortfolio, setShowPortfolio] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [loadedRecordingId, setLoadedRecordingId] = useState<string | null>(null);
+
+  // Bootstrap auth from localStorage + handle magic token in URL
+  useEffect(() => {
+    const stored = readStoredUser();
+    if (stored) {
+      setAuthUser(stored);
+      setAuthStatus('authed');
+    } else {
+      setAuthStatus('anonymous');
+    }
+
+    // Check for magic token in URL
+    const url = new URL(window.location.href);
+    const magic = url.searchParams.get('magic');
+    if (magic) {
+      setAuthStatus('checking');
+      verifyMagicToken(magic)
+        .then((user) => {
+          setAuthUser(user);
+          setAuthStatus('authed');
+          url.searchParams.delete('magic');
+          window.history.replaceState({}, '', url.toString());
+        })
+        .catch(() => {
+          setAuthStatus('anonymous');
+        });
+    }
+  }, []);
+
+  const handleSendMagicLink = async () => {
+    if (!loginEmail.trim()) return;
+    setLoginError('');
+    setLoginMessage('');
+    setLoginLoading(true);
+    try {
+      await sendMagicLink(loginEmail);
+      setLoginMessage('Magic link sent! Check your email.');
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : 'Failed to send magic link.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    clearUser();
+    setAuthUser(null);
+    setAuthStatus('anonymous');
+    setShowPortfolio(false);
+  };
+
+  const handlePortfolioSelect = (rec: PortfolioRecording) => {
+    const url = rec.audioUrl || (rec.r2Key ? `${UPLOAD_API}/audio/${rec.r2Key}` : null);
+    if (url) {
+      setAudioUrl(url);
+      setLoadedRecordingId(rec.id);
+      initWaveSurfer(url);
+      setShowPortfolio(false);
+    }
+  };
 
   const initWaveSurfer = useCallback((url: string) => {
     if (!waveformRef.current) return;
@@ -415,6 +640,75 @@ export default function App() {
     }
   };
 
+  const saveClipToPortfolio = async () => {
+    if (!activeRegion || !audioUrl || !wavesurfer.current || !authUser) return;
+
+    try {
+      setIsSaving(true);
+      setSaveMessage(null);
+
+      // 1. Extract clip (same logic as downloadClip)
+      const response = await fetch(audioUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
+      const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
+      const frameCount = endSample - startSample;
+      const newBuffer = audioCtx.createBuffer(audioBuffer.numberOfChannels, frameCount, audioBuffer.sampleRate);
+      for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
+        const channelData = audioBuffer.getChannelData(i);
+        const newChannelData = newBuffer.getChannelData(i);
+        for (let j = 0; j < frameCount; j++) {
+          newChannelData[j] = channelData[startSample + j];
+        }
+      }
+      const wavBlob = audioBufferToWav(newBuffer);
+      audioCtx.close();
+
+      // 2. Upload WAV to R2
+      const clipName = `clip-${Date.now()}-${Math.floor(activeRegion.start)}s-${Math.floor(activeRegion.end)}s.wav`;
+      const formData = new FormData();
+      formData.append('file', wavBlob, clipName);
+      formData.append('userEmail', authUser.email);
+
+      const uploadRes = await fetch(`${UPLOAD_API}/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!uploadRes.ok) throw new Error('Failed to upload clip to storage');
+      const uploadData = await uploadRes.json();
+
+      // 3. Save metadata to portfolio
+      const tags = ['clip', 'audio-studio'];
+      if (loadedRecordingId) tags.push(`clipped-from:${loadedRecordingId}`);
+
+      const metaRes = await fetch(`${PORTFOLIO_API}/save-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userEmail: authUser.email,
+          displayName: clipName.replace('.wav', ''),
+          duration: activeRegion.end - activeRegion.start,
+          category: 'clip',
+          r2Key: uploadData.key || uploadData.r2Key || clipName,
+          audioUrl: uploadData.url || uploadData.audioUrl,
+          tags,
+        }),
+      });
+      if (!metaRes.ok) throw new Error('Failed to save clip metadata');
+
+      setSaveMessage('Clip saved to portfolio!');
+      setTimeout(() => setSaveMessage(null), 3000);
+    } catch (err) {
+      console.error('Save to portfolio error:', err);
+      setSaveMessage(`Error: ${err instanceof Error ? err.message : 'Failed to save clip'}`);
+      setTimeout(() => setSaveMessage(null), 5000);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans p-4 md:p-8">
       <div className="max-w-5xl mx-auto">
@@ -429,7 +723,79 @@ export default function App() {
               <p className="text-zinc-500 text-sm italic">Visualize, play, and trim your audio</p>
             </div>
           </div>
+
+          {/* Auth Controls */}
+          <div className="flex items-center gap-3">
+            {authStatus === 'checking' && (
+              <div className="flex items-center gap-2 text-zinc-400 text-sm">
+                <Loader2 size={16} className="animate-spin" /> Checking...
+              </div>
+            )}
+            {authStatus === 'authed' && authUser && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowPortfolio(!showPortfolio)}
+                  className="flex items-center gap-2 px-3 py-2 bg-indigo-50 text-indigo-700 rounded-lg hover:bg-indigo-100 transition-colors text-sm font-medium"
+                >
+                  <FolderOpen size={16} />
+                  Portfolio
+                </button>
+                <span className="text-xs text-zinc-500">{authUser.email}</span>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="flex items-center gap-1 px-3 py-2 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-sm"
+                  title="Log out"
+                >
+                  <LogOut size={16} />
+                </button>
+              </>
+            )}
+            {authStatus === 'anonymous' && (
+              <div className="flex items-center gap-2">
+                <input
+                  type="email"
+                  placeholder="email@example.com"
+                  value={loginEmail}
+                  onChange={(e) => setLoginEmail(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSendMagicLink()}
+                  className="px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm w-48 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleSendMagicLink}
+                  disabled={loginLoading}
+                  className="flex items-center gap-1 px-3 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium disabled:opacity-50"
+                >
+                  {loginLoading ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                  Login
+                </button>
+              </div>
+            )}
+          </div>
         </header>
+
+        {/* Login feedback */}
+        {(loginMessage || loginError) && (
+          <div className={`mb-4 px-4 py-2 rounded-lg text-sm ${loginError ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'}`}>
+            {loginError || loginMessage}
+          </div>
+        )}
+
+        {/* Save feedback */}
+        <AnimatePresence>
+          {saveMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className={`mb-4 px-4 py-2 rounded-lg text-sm ${saveMessage.startsWith('Error') ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600'}`}
+            >
+              {saveMessage}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <main className="grid gap-6">
           {/* Input Section */}
@@ -471,6 +837,17 @@ export default function App() {
               </div>
             </div>
           </section>
+
+          {/* Portfolio Browser */}
+          <AnimatePresence>
+            {showPortfolio && authUser && (
+              <PortfolioBrowser
+                email={authUser.email}
+                onSelect={handlePortfolioSelect}
+                onClose={() => setShowPortfolio(false)}
+              />
+            )}
+          </AnimatePresence>
 
           {/* Waveform Section */}
           <section className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm min-h-[300px] flex flex-col overflow-hidden">
@@ -535,14 +912,17 @@ export default function App() {
 
                 {/* Clipping Controls */}
                 <div className="flex items-center gap-2">
-                  <ClippingControls 
+                  <ClippingControls
                     activeRegion={activeRegion}
                     duration={duration}
                     isExporting={isExporting}
+                    isSaving={isSaving}
                     isPlaying={isPlaying}
+                    isLoggedIn={authStatus === 'authed'}
                     onPlayRegion={playRegion}
                     onManualChange={handleRegionManualChange}
                     onDownload={downloadClip}
+                    onSaveToPortfolio={saveClipToPortfolio}
                     onClear={clearRegion}
                     onAdd={addRegion}
                   />
@@ -617,7 +997,7 @@ export default function App() {
         </main>
 
         <footer className="mt-12 text-center text-zinc-400 text-xs">
-          <p>&copy; 2024 Audio Studio. Built with WaveSurfer.js</p>
+          <p>&copy; 2024 Audio Studio &mdash; Vegvisr. Built with WaveSurfer.js</p>
         </footer>
       </div>
     </div>
