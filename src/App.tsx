@@ -31,7 +31,8 @@ import {
   ChevronRight,
   Mic,
   MicOff,
-  Square
+  Square,
+  ScissorsLineDashed
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
@@ -378,12 +379,14 @@ interface ClippingControlsProps {
   duration: number;
   isExporting: boolean;
   isSaving: boolean;
+  isCutting: boolean;
   isPlaying: boolean;
   isLoggedIn: boolean;
   onPlayRegion: () => void;
   onManualChange: (type: 'start' | 'end', value: string) => void;
   onDownload: () => void;
   onSaveToPortfolio: () => void;
+  onCutRegion: () => void;
   onClear: () => void;
   onAdd: () => void;
 }
@@ -431,12 +434,14 @@ const ClippingControls = React.memo(({
   duration,
   isExporting,
   isSaving,
+  isCutting,
   isPlaying,
   isLoggedIn,
   onPlayRegion,
   onManualChange,
   onDownload,
   onSaveToPortfolio,
+  onCutRegion,
   onClear,
   onAdd
 }: ClippingControlsProps) => {
@@ -484,6 +489,15 @@ const ClippingControls = React.memo(({
         {isExporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
         {isExporting ? 'Exporting...' : 'Export Clip'}
       </button>
+      <button
+        onClick={onCutRegion}
+        disabled={isCutting}
+        className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+        title="Remove selected region from the audio"
+      >
+        {isCutting ? <Loader2 size={16} className="animate-spin" /> : <ScissorsLineDashed size={16} />}
+        {isCutting ? 'Cutting...' : 'Cut Out'}
+      </button>
       {isLoggedIn && (
         <button
           onClick={onSaveToPortfolio}
@@ -523,6 +537,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCutting, setIsCutting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeRegion, setActiveRegion] = useState<{ start: number; end: number } | null>(null);
 
@@ -950,6 +965,68 @@ export default function App() {
     }
   };
 
+  const cutRegion = async () => {
+    if (!activeRegion || !audioUrl || !wavesurfer.current) return;
+
+    try {
+      setIsCutting(true);
+
+      // 1. Fetch and decode the full audio
+      const response = await fetch(audioUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      // 2. Calculate samples for before + after the cut region
+      const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
+      const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
+      const beforeLength = startSample;
+      const afterLength = audioBuffer.length - endSample;
+      const newLength = beforeLength + afterLength;
+
+      if (newLength <= 0) {
+        alert('Cannot cut the entire audio.');
+        setIsCutting(false);
+        return;
+      }
+
+      // 3. Create new buffer without the selected region
+      const newBuffer = audioCtx.createBuffer(
+        audioBuffer.numberOfChannels,
+        newLength,
+        audioBuffer.sampleRate
+      );
+
+      for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+        const oldData = audioBuffer.getChannelData(ch);
+        const newData = newBuffer.getChannelData(ch);
+        // Copy before region
+        for (let i = 0; i < beforeLength; i++) {
+          newData[i] = oldData[i];
+        }
+        // Copy after region
+        for (let i = 0; i < afterLength; i++) {
+          newData[beforeLength + i] = oldData[endSample + i];
+        }
+      }
+
+      // 4. Encode to WAV and reload
+      const wavBlob = audioBufferToWav(newBuffer);
+      audioCtx.close();
+
+      const newUrl = URL.createObjectURL(wavBlob);
+      setAudioUrl(newUrl);
+      initWaveSurfer(newUrl);
+      // Region is gone after the cut
+      clearRegion();
+    } catch (err) {
+      console.error('Cut error:', err);
+      alert('Failed to cut region. This might be due to CORS restrictions or an unsupported format.');
+    } finally {
+      setIsCutting(false);
+    }
+  };
+
   const saveClipToPortfolio = async () => {
     if (!activeRegion || !audioUrl || !wavesurfer.current || !authUser) return;
 
@@ -1313,12 +1390,14 @@ export default function App() {
                     duration={duration}
                     isExporting={isExporting}
                     isSaving={isSaving}
+                    isCutting={isCutting}
                     isPlaying={isPlaying}
                     isLoggedIn={authStatus === 'authed'}
                     onPlayRegion={playRegion}
                     onManualChange={handleRegionManualChange}
                     onDownload={downloadClip}
                     onSaveToPortfolio={openSaveDialog}
+                    onCutRegion={cutRegion}
                     onClear={clearRegion}
                     onAdd={addRegion}
                   />
