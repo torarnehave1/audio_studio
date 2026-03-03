@@ -63,7 +63,8 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
     const fetchRecordings = async () => {
       try {
         setLoading(true);
-        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}`);
+        // Fetch all recordings (Superadmin view, same as Agent Builder)
+        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&userRole=Superadmin&limit=200`);
         if (!res.ok) throw new Error('Failed to fetch recordings');
         const data = await res.json();
         setRecordings(data.recordings || []);
@@ -324,6 +325,12 @@ export default function App() {
   const [showPortfolio, setShowPortfolio] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [loadedRecordingId, setLoadedRecordingId] = useState<string | null>(null);
+  const [loadedRecordingName, setLoadedRecordingName] = useState<string | null>(null);
+
+  // Save dialog state
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [clipName, setClipName] = useState('');
+  const [clipCategory, setClipCategory] = useState('clip');
 
   // Bootstrap auth from localStorage + handle magic token in URL
   useEffect(() => {
@@ -380,9 +387,19 @@ export default function App() {
     if (url) {
       setAudioUrl(url);
       setLoadedRecordingId(rec.id);
+      setLoadedRecordingName(rec.displayName || 'Untitled');
       initWaveSurfer(url);
       setShowPortfolio(false);
     }
+  };
+
+  const openSaveDialog = () => {
+    const defaultName = loadedRecordingName
+      ? `Clip of ${loadedRecordingName}`
+      : `Clip ${Math.floor(activeRegion?.start ?? 0)}s-${Math.floor(activeRegion?.end ?? 0)}s`;
+    setClipName(defaultName);
+    setClipCategory('clip');
+    setShowSaveDialog(true);
   };
 
   const initWaveSurfer = useCallback((url: string) => {
@@ -666,38 +683,49 @@ export default function App() {
       const wavBlob = audioBufferToWav(newBuffer);
       audioCtx.close();
 
-      // 2. Upload WAV to R2
-      const clipName = `clip-${Date.now()}-${Math.floor(activeRegion.start)}s-${Math.floor(activeRegion.end)}s.wav`;
-      const formData = new FormData();
-      formData.append('file', wavBlob, clipName);
-      formData.append('userEmail', authUser.email);
-
+      // 2. Upload WAV to R2 (raw blob + X-File-Name header, same as AudioClipModal)
+      const fileName = `clip-${Date.now()}.wav`;
       const uploadRes = await fetch(`${UPLOAD_API}/upload`, {
         method: 'POST',
-        body: formData,
+        headers: { 'X-File-Name': encodeURIComponent(fileName) },
+        body: wavBlob,
       });
-      if (!uploadRes.ok) throw new Error('Failed to upload clip to storage');
-      const uploadData = await uploadRes.json();
+      if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
+      const { r2Key, audioUrl: r2Url } = await uploadRes.json();
 
-      // 3. Save metadata to portfolio
+      // 3. Save metadata to portfolio (same format as AudioClipModal)
+      const clipDuration = activeRegion.end - activeRegion.start;
       const tags = ['clip', 'audio-studio'];
       if (loadedRecordingId) tags.push(`clipped-from:${loadedRecordingId}`);
 
+      const recordingData = {
+        userEmail: authUser.email,
+        fileName,
+        displayName: clipName || `Clip of ${loadedRecordingName || 'Untitled'}`,
+        fileSize: wavBlob.size,
+        duration: Math.round(clipDuration),
+        r2Key,
+        r2Url,
+        transcriptionText: '',
+        category: clipCategory || 'clip',
+        tags,
+        audioFormat: 'wav',
+        aiService: 'none',
+        aiModel: 'none',
+        processingTime: 0,
+      };
+
       const metaRes = await fetch(`${PORTFOLIO_API}/save-recording`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userEmail: authUser.email,
-          displayName: clipName.replace('.wav', ''),
-          duration: activeRegion.end - activeRegion.start,
-          category: 'clip',
-          r2Key: uploadData.key || uploadData.r2Key || clipName,
-          audioUrl: uploadData.url || uploadData.audioUrl,
-          tags,
-        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-Email': authUser.email,
+        },
+        body: JSON.stringify(recordingData),
       });
-      if (!metaRes.ok) throw new Error('Failed to save clip metadata');
+      if (!metaRes.ok) throw new Error(`Save failed: ${metaRes.status}`);
 
+      setShowSaveDialog(false);
       setSaveMessage('Clip saved to portfolio!');
       setTimeout(() => setSaveMessage(null), 3000);
     } catch (err) {
@@ -793,6 +821,74 @@ export default function App() {
               className={`mb-4 px-4 py-2 rounded-lg text-sm ${saveMessage.startsWith('Error') ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600'}`}
             >
               {saveMessage}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Save to Portfolio Dialog */}
+        <AnimatePresence>
+          {showSaveDialog && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+              onClick={() => setShowSaveDialog(false)}
+            >
+              <motion.div
+                initial={{ scale: 0.95, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.95, opacity: 0 }}
+                className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <h3 className="text-lg font-bold mb-4">Save Clip to Portfolio</h3>
+                <div className="space-y-3 mb-5">
+                  <div>
+                    <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Clip Name</label>
+                    <input
+                      type="text"
+                      value={clipName}
+                      onChange={(e) => setClipName(e.target.value)}
+                      className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                      placeholder="e.g. Intro segment"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Category</label>
+                    <input
+                      type="text"
+                      value={clipCategory}
+                      onChange={(e) => setClipCategory(e.target.value)}
+                      className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                      placeholder="e.g. clip, podcast, music"
+                    />
+                  </div>
+                  {activeRegion && (
+                    <p className="text-xs text-zinc-400">
+                      Region: {Math.floor(activeRegion.start / 60)}:{(activeRegion.start % 60).toFixed(1).padStart(4, '0')} &ndash; {Math.floor(activeRegion.end / 60)}:{(activeRegion.end % 60).toFixed(1).padStart(4, '0')} ({(activeRegion.end - activeRegion.start).toFixed(1)}s)
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-3 justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveDialog(false)}
+                    className="px-4 py-2 text-zinc-500 hover:text-zinc-700 text-sm font-medium"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveClipToPortfolio}
+                    disabled={isSaving}
+                    className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium disabled:opacity-50"
+                  >
+                    {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                    {isSaving ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -922,7 +1018,7 @@ export default function App() {
                     onPlayRegion={playRegion}
                     onManualChange={handleRegionManualChange}
                     onDownload={downloadClip}
-                    onSaveToPortfolio={saveClipToPortfolio}
+                    onSaveToPortfolio={openSaveDialog}
                     onClear={clearRegion}
                     onAdd={addRegion}
                   />
