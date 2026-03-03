@@ -897,9 +897,17 @@ export default function App() {
     if (file) {
       const url = URL.createObjectURL(file);
       setTrack2Url(url);
-      initWaveSurfer2(url);
+      // Don't call initWaveSurfer2 here — the ref div isn't mounted yet.
+      // A useEffect below will init after React re-renders the DOM.
     }
   };
+
+  // Initialize Track 2 WaveSurfer after the DOM has rendered the container
+  useEffect(() => {
+    if (track2Url && waveformRef2.current && !wavesurfer2.current) {
+      initWaveSurfer2(track2Url);
+    }
+  }, [track2Url, initWaveSurfer2]);
 
   const removeTrack2 = () => {
     if (wavesurfer2.current) {
