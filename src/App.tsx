@@ -1342,10 +1342,14 @@ export default function App() {
       <div className="max-w-5xl mx-auto">
         {/* Header */}
         <header className="mb-8 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-indigo-200">
-              <Music size={24} />
-            </div>
+          <div className="flex items-center gap-4">
+            <img
+              src="https://favicons.vegvisr.org/favicons/1772389497421-1-1772573382892-512x512.png"
+              alt="Vegvisr logo"
+              width={100}
+              height={100}
+              className="rounded-xl shadow-lg"
+            />
             <div>
               <h1 className="text-2xl font-bold tracking-tight">Audio Studio</h1>
               <p className="text-zinc-500 text-sm italic">Visualize, play, and trim your audio</p>
