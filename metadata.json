@@ -1,0 +1,5 @@
+{
+  "name": "Audio Studio",
+  "description": "A powerful web-based audio editor to visualize, play, and clip audio files from URLs or local uploads.",
+  "requestFramePermissions": []
+}
