@@ -166,10 +166,15 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
 /* ── Voice Recorder ── */
 type RecorderState = 'idle' | 'recording' | 'paused';
 
-const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Blob) => void }) => {
+const VoiceRecorder = ({ onRecordingComplete, hasAudio, onAppendRecording }: {
+  onRecordingComplete: (blob: Blob) => void;
+  hasAudio: boolean;
+  onAppendRecording: (blob: Blob) => void;
+}) => {
   const [recorderState, setRecorderState] = useState<RecorderState>('idle');
   const [recordingTime, setRecordingTime] = useState(0);
   const [micError, setMicError] = useState<string | null>(null);
+  const [isAppendMode, setIsAppendMode] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -226,9 +231,15 @@ const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Bl
         // Stop all mic tracks
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
+        const wasAppend = isAppendMode;
         setRecorderState('idle');
         setRecordingTime(0);
-        onRecordingComplete(blob);
+        setIsAppendMode(false);
+        if (wasAppend) {
+          onAppendRecording(blob);
+        } else {
+          onRecordingComplete(blob);
+        }
       };
 
       mediaRecorderRef.current = recorder;
@@ -275,6 +286,11 @@ const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Bl
     };
   }, []);
 
+  const startAppendRecording = () => {
+    setIsAppendMode(true);
+    startRecording();
+  };
+
   if (recorderState === 'idle') {
     return (
       <div>
@@ -286,9 +302,21 @@ const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Bl
         >
           <div className="flex items-center gap-2 text-zinc-500 group-hover:text-red-600">
             <Mic size={18} />
-            <span className="text-sm font-medium">Start Recording</span>
+            <span className="text-sm font-medium">New Recording</span>
           </div>
         </button>
+        {hasAudio && (
+          <button
+            type="button"
+            onClick={startAppendRecording}
+            className="flex items-center justify-center w-full h-9 mt-2 px-4 bg-indigo-50 border border-indigo-200 rounded-lg cursor-pointer hover:bg-indigo-100 transition-all group"
+          >
+            <div className="flex items-center gap-2 text-indigo-500 group-hover:text-indigo-700">
+              <Mic size={14} />
+              <span className="text-xs font-medium">Continue Recording</span>
+            </div>
+          </button>
+        )}
         {micError && (
           <div className="mt-2 flex items-center gap-1 text-xs text-red-500">
             <MicOff size={12} /> {micError}
@@ -309,7 +337,7 @@ const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Bl
           {formatRecTime(recordingTime)}
         </span>
         <span className="text-xs text-red-400 uppercase font-semibold">
-          {recorderState === 'recording' ? 'Recording' : 'Paused'}
+          {recorderState === 'paused' ? 'Paused' : isAppendMode ? 'Appending' : 'Recording'}
         </span>
         <div className="ml-auto flex items-center gap-2">
           {recorderState === 'recording' ? (
@@ -584,6 +612,78 @@ export default function App() {
     setLoadedRecordingId(null);
     setLoadedRecordingName('Voice Recording');
     initWaveSurfer(url);
+  };
+
+  const handleAppendRecording = async (newBlob: Blob) => {
+    if (!audioUrl) {
+      // No existing audio — treat as new recording
+      handleRecordingComplete(newBlob);
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      setError(null);
+
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+      // Decode existing audio
+      const existingResponse = await fetch(audioUrl);
+      const existingArrayBuffer = await existingResponse.arrayBuffer();
+      const existingBuffer = await audioCtx.decodeAudioData(existingArrayBuffer);
+
+      // Decode new recording
+      const newArrayBuffer = await newBlob.arrayBuffer();
+      const newBuffer = await audioCtx.decodeAudioData(newArrayBuffer);
+
+      // Concatenate: use existing sample rate, mono or match channels
+      const sampleRate = existingBuffer.sampleRate;
+      const channels = Math.max(existingBuffer.numberOfChannels, newBuffer.numberOfChannels);
+      const totalLength = existingBuffer.length + Math.round(newBuffer.length * sampleRate / newBuffer.sampleRate);
+
+      const combined = audioCtx.createBuffer(channels, totalLength, sampleRate);
+
+      for (let ch = 0; ch < channels; ch++) {
+        const outData = combined.getChannelData(ch);
+        // Copy existing
+        const existCh = ch < existingBuffer.numberOfChannels ? existingBuffer.getChannelData(ch) : existingBuffer.getChannelData(0);
+        outData.set(existCh, 0);
+
+        // Copy new (resample if needed)
+        const newCh = ch < newBuffer.numberOfChannels ? newBuffer.getChannelData(ch) : newBuffer.getChannelData(0);
+        if (newBuffer.sampleRate === sampleRate) {
+          outData.set(newCh, existingBuffer.length);
+        } else {
+          // Simple linear resample
+          const ratio = newBuffer.sampleRate / sampleRate;
+          const newLen = totalLength - existingBuffer.length;
+          for (let i = 0; i < newLen; i++) {
+            const srcIdx = i * ratio;
+            const idx = Math.floor(srcIdx);
+            const frac = srcIdx - idx;
+            const s0 = newCh[idx] || 0;
+            const s1 = newCh[idx + 1] || s0;
+            outData[existingBuffer.length + i] = s0 + frac * (s1 - s0);
+          }
+        }
+      }
+
+      // Encode to WAV and reload
+      const wavBlob = audioBufferToWav(combined);
+      audioCtx.close();
+
+      const combinedUrl = URL.createObjectURL(wavBlob);
+      setAudioUrl(combinedUrl);
+      setLoadedRecordingName(loadedRecordingName || 'Voice Recording');
+      initWaveSurfer(combinedUrl);
+    } catch (err) {
+      console.error('Append recording error:', err);
+      setError('Failed to append recording. The new recording will be loaded separately.');
+      // Fallback: just load the new recording
+      handleRecordingComplete(newBlob);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const openSaveDialog = () => {
@@ -1126,7 +1226,11 @@ export default function App() {
               </div>
 
               {/* Voice Recorder */}
-              <VoiceRecorder onRecordingComplete={handleRecordingComplete} />
+              <VoiceRecorder
+                onRecordingComplete={handleRecordingComplete}
+                hasAudio={!!audioUrl}
+                onAppendRecording={handleAppendRecording}
+              />
             </div>
           </section>
 
