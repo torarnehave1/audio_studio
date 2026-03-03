@@ -28,7 +28,10 @@ import {
   Save,
   X,
   Search,
-  ChevronRight
+  ChevronRight,
+  Mic,
+  MicOff,
+  Square
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
@@ -157,6 +160,188 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
         </div>
       )}
     </motion.div>
+  );
+};
+
+/* ── Voice Recorder ── */
+type RecorderState = 'idle' | 'recording' | 'paused';
+
+const VoiceRecorder = ({ onRecordingComplete }: { onRecordingComplete: (blob: Blob) => void }) => {
+  const [recorderState, setRecorderState] = useState<RecorderState>('idle');
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  const formatRecTime = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const startTimer = () => {
+    timerRef.current = setInterval(() => {
+      setRecordingTime((prev) => prev + 1);
+    }, 1000);
+  };
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const startRecording = async () => {
+    try {
+      setMicError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '';
+
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+
+      audioChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        stopTimer();
+        const blob = new Blob(audioChunksRef.current, {
+          type: recorder.mimeType || 'audio/webm',
+        });
+        // Stop all mic tracks
+        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+        setRecorderState('idle');
+        setRecordingTime(0);
+        onRecordingComplete(blob);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250); // collect data every 250ms for smooth pause/resume
+      setRecorderState('recording');
+      setRecordingTime(0);
+      startTimer();
+    } catch (err) {
+      console.error('Mic access error:', err);
+      setMicError('Microphone access denied. Please allow mic permissions.');
+    }
+  };
+
+  const pauseRecording = () => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.pause();
+      stopTimer();
+      setRecorderState('paused');
+    }
+  };
+
+  const resumeRecording = () => {
+    if (mediaRecorderRef.current?.state === 'paused') {
+      mediaRecorderRef.current.resume();
+      startTimer();
+      setRecorderState('recording');
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopTimer();
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
+  if (recorderState === 'idle') {
+    return (
+      <div>
+        <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-2">Record Voice</label>
+        <button
+          type="button"
+          onClick={startRecording}
+          className="flex items-center justify-center w-full h-11 px-4 bg-zinc-50 border-2 border-dashed border-zinc-200 rounded-lg cursor-pointer hover:border-red-400 hover:bg-red-50/30 transition-all group"
+        >
+          <div className="flex items-center gap-2 text-zinc-500 group-hover:text-red-600">
+            <Mic size={18} />
+            <span className="text-sm font-medium">Start Recording</span>
+          </div>
+        </button>
+        {micError && (
+          <div className="mt-2 flex items-center gap-1 text-xs text-red-500">
+            <MicOff size={12} /> {micError}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-2">Recording</label>
+      <div className="flex items-center gap-3 h-11 px-4 bg-red-50 border border-red-200 rounded-lg">
+        {/* Animated recording dot */}
+        <div className={`w-3 h-3 rounded-full ${recorderState === 'recording' ? 'bg-red-500 animate-pulse' : 'bg-amber-400'}`} />
+        {/* Timer */}
+        <span className="font-mono text-sm font-bold text-red-700 min-w-[48px]">
+          {formatRecTime(recordingTime)}
+        </span>
+        <span className="text-xs text-red-400 uppercase font-semibold">
+          {recorderState === 'recording' ? 'Recording' : 'Paused'}
+        </span>
+        <div className="ml-auto flex items-center gap-2">
+          {recorderState === 'recording' ? (
+            <button
+              type="button"
+              onClick={pauseRecording}
+              className="w-8 h-8 flex items-center justify-center bg-white text-amber-600 rounded-lg hover:bg-amber-50 transition-colors border border-amber-200"
+              title="Pause recording"
+            >
+              <Pause size={16} />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={resumeRecording}
+              className="w-8 h-8 flex items-center justify-center bg-white text-emerald-600 rounded-lg hover:bg-emerald-50 transition-colors border border-emerald-200"
+              title="Resume recording"
+            >
+              <Play size={16} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={stopRecording}
+            className="w-8 h-8 flex items-center justify-center bg-white text-red-600 rounded-lg hover:bg-red-100 transition-colors border border-red-200"
+            title="Stop recording"
+          >
+            <Square size={14} fill="currentColor" />
+          </button>
+        </div>
+      </div>
+    </div>
   );
 };
 
@@ -391,6 +576,14 @@ export default function App() {
       initWaveSurfer(url);
       setShowPortfolio(false);
     }
+  };
+
+  const handleRecordingComplete = (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    setAudioUrl(url);
+    setLoadedRecordingId(null);
+    setLoadedRecordingName('Voice Recording');
+    initWaveSurfer(url);
   };
 
   const openSaveDialog = () => {
@@ -896,22 +1089,22 @@ export default function App() {
         <main className="grid gap-6">
           {/* Input Section */}
           <section className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
-            <div className="grid md:grid-cols-2 gap-6">
+            <div className="grid md:grid-cols-3 gap-6">
               {/* URL Input */}
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-2">Load from URL</label>
                 <form onSubmit={handleUrlSubmit} className="flex gap-2">
                   <div className="relative flex-1">
                     <LinkIcon className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={18} />
-                    <input 
-                      type="url" 
+                    <input
+                      type="url"
                       placeholder="https://example.com/audio.mp3"
                       className="w-full pl-10 pr-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                       value={inputUrl}
                       onChange={(e) => setInputUrl(e.target.value)}
                     />
                   </div>
-                  <button 
+                  <button
                     type="submit"
                     className="px-4 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 transition-colors flex items-center gap-2"
                   >
@@ -931,6 +1124,9 @@ export default function App() {
                   <input type="file" className="hidden" accept="audio/*" onChange={handleFileUpload} />
                 </label>
               </div>
+
+              {/* Voice Recorder */}
+              <VoiceRecorder onRecordingComplete={handleRecordingComplete} />
             </div>
           </section>
 
