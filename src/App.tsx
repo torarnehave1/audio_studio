@@ -1351,7 +1351,7 @@ export default function App() {
               className="rounded-xl shadow-lg"
             />
             <div>
-              <h1 className="text-2xl font-bold tracking-tight">Audio Studio</h1>
+              <h1 className="text-2xl font-bold tracking-tight">Audio Studio <span className="ml-2 px-2 py-0.5 text-xs font-semibold uppercase tracking-wider bg-amber-100 text-amber-700 rounded-full align-middle">Beta</span></h1>
               <p className="text-zinc-500 text-sm italic">Visualize, play, and trim your audio</p>
             </div>
           </div>
