@@ -92,11 +92,13 @@ function mixTwoBuffers(
 
 interface PortfolioRecording {
   id: string;
+  recordingId?: string;
   displayName: string;
   duration: number;
   category: string;
   createdAt: string;
   audioUrl?: string;
+  r2Url?: string;
   r2Key?: string;
   tags?: string[];
 }
@@ -191,7 +193,7 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
         <div className="max-h-64 overflow-y-auto space-y-1">
           {filtered.map((rec) => (
             <button
-              key={rec.id}
+              key={rec.recordingId || rec.id}
               onClick={() => onSelect(rec)}
               className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-indigo-50 transition-colors text-left group"
             >
@@ -668,13 +670,15 @@ export default function App() {
   };
 
   const handlePortfolioSelect = (rec: PortfolioRecording) => {
-    const url = rec.audioUrl || (rec.r2Key ? `${UPLOAD_API}/audio/${rec.r2Key}` : null);
+    const url = rec.audioUrl || rec.r2Url || (rec.r2Key ? `https://audio.vegvisr.org/${rec.r2Key}` : null);
     if (url) {
       setAudioUrl(url);
-      setLoadedRecordingId(rec.id);
+      setLoadedRecordingId(rec.recordingId || rec.id);
       setLoadedRecordingName(rec.displayName || 'Untitled');
       initWaveSurfer(url);
       setShowPortfolio(false);
+    } else {
+      setError('This portfolio recording has no playable audio URL. Try saving it again from Audio Portfolio.');
     }
   };
 
