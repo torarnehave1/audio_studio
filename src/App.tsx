@@ -1291,7 +1291,12 @@ export default function App() {
       const fileName = `${activeRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
       const uploadRes = await fetch(`${UPLOAD_API}/upload`, {
         method: 'POST',
-        headers: { 'X-File-Name': encodeURIComponent(fileName) },
+        headers: {
+          'X-File-Name': encodeURIComponent(fileName),
+          // Lets the worker route this founder's audio to their OWN R2 bucket when configured
+          // (vegvisr_org.config), instead of the shared whisper-audio-temp bucket.
+          'X-User-Email': authUser.email,
+        },
         body: wavBlob,
       });
       if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
