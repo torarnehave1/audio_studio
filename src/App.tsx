@@ -43,6 +43,68 @@ import ImpersonationBar from './components/ImpersonationBar';
 const PORTFOLIO_API = 'https://audio-portfolio-worker.torarnehave.workers.dev';
 const UPLOAD_API = 'https://norwegian-transcription-worker.torarnehave.workers.dev';
 
+/**
+ * Uploads a recording to R2 via chunked multipart (8MB parts) instead of one big POST — a
+ * single-shot upload of a real recording hits Cloudflare's per-request body size limit and
+ * fails with a bare CORS/"Failed to fetch" error (a 413 edge response carries no CORS headers,
+ * so the browser reports both). Mirrors vegvisr-realtime's founder upload flow.
+ */
+async function uploadAudioToR2Chunked(
+  blob: Blob,
+  fileName: string,
+  contentType: string,
+  userEmail: string
+): Promise<{ r2Key: string; audioUrl: string | null }> {
+  const initRes = await fetch(`${UPLOAD_API}/upload/init`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: fileName, contentType, size: blob.size, userEmail }),
+  });
+  const initData = await initRes.json();
+  if (!initRes.ok || !initData.success) throw new Error(initData.error || `Upload init failed with status ${initRes.status}`);
+  const { uploadId, key } = initData as { uploadId: string; key: string };
+
+  const chunkSize = 8 * 1024 * 1024;
+  const parts: Array<{ partNumber: number; etag: string }> = [];
+  const totalParts = Math.max(1, Math.ceil(blob.size / chunkSize));
+
+  try {
+    for (let partNumber = 1; partNumber <= totalParts; partNumber += 1) {
+      const start = (partNumber - 1) * chunkSize;
+      const chunk = blob.slice(start, Math.min(blob.size, start + chunkSize));
+      const params = new URLSearchParams({ key, uploadId, partNumber: String(partNumber), userEmail });
+      const partRes = await fetch(`${UPLOAD_API}/upload/part?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+      const partData = await partRes.json();
+      if (!partRes.ok || !partData.success || !partData.part?.etag) {
+        throw new Error(partData.error || `Upload part ${partNumber} failed with status ${partRes.status}`);
+      }
+      parts.push({ partNumber: Number(partData.part.partNumber), etag: String(partData.part.etag) });
+    }
+
+    const completeRes = await fetch(`${UPLOAD_API}/upload/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, uploadId, parts, name: fileName, size: blob.size, contentType, userEmail }),
+    });
+    const completeData = await completeRes.json();
+    if (!completeRes.ok || !completeData.success) {
+      throw new Error(completeData.error || `Upload complete failed with status ${completeRes.status}`);
+    }
+    return { r2Key: completeData.r2Key, audioUrl: completeData.audioUrl || null };
+  } catch (err) {
+    await fetch(`${UPLOAD_API}/upload/abort`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, uploadId, userEmail }),
+    }).catch(() => { /* best-effort cleanup */ });
+    throw err;
+  }
+}
+
 /** Mix two AudioBuffers together with per-track volume. Returns a new AudioBuffer. */
 function mixTwoBuffers(
   audioCtx: AudioContext,
@@ -1290,20 +1352,10 @@ export default function App() {
       }
       audioCtx.close();
 
-      // Upload WAV to R2
+      // Upload WAV to R2 — chunked so it lands in the founder's own bucket when configured
+      // (vegvisr_org.config) without hitting the per-request body size limit on large files.
       const fileName = `${activeRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
-      const uploadRes = await fetch(`${UPLOAD_API}/upload`, {
-        method: 'POST',
-        headers: {
-          'X-File-Name': encodeURIComponent(fileName),
-          // Lets the worker route this founder's audio to their OWN R2 bucket when configured
-          // (vegvisr_org.config), instead of the shared whisper-audio-temp bucket.
-          'X-User-Email': authUser.email,
-        },
-        body: wavBlob,
-      });
-      if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
-      const { r2Key, audioUrl: r2Url } = await uploadRes.json();
+      const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(wavBlob, fileName, 'audio/wav', authUser.email);
 
       // Save metadata to portfolio
       const tags = [activeRegion ? 'clip' : 'full-audio', 'audio-studio'];
