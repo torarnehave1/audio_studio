@@ -10,6 +10,8 @@ export type AuthUser = {
   userId: string;
   email: string;
   role: string | null;
+  emailVerificationToken?: string | null;
+  displayName?: string | null;
 };
 
 export type AuthStatus = 'checking' | 'authed' | 'anonymous';
@@ -23,7 +25,13 @@ export const readStoredUser = (): AuthUser | null => {
     const userId = parsed.user_id || parsed.oauth_id;
     const email = parsed.email;
     if (!userId || !email) return null;
-    return { userId, email, role: parsed.role || null };
+    return {
+      userId,
+      email,
+      role: parsed.role || null,
+      emailVerificationToken: parsed.emailVerificationToken || null,
+      displayName: parsed.displayName || parsed.display_name || null,
+    };
   } catch {
     return null;
   }
@@ -86,7 +94,7 @@ export const verifyMagicToken = async (token: string): Promise<AuthUser> => {
   try {
     const ctx = await fetchUserContext(data.email);
     persistUser(ctx);
-    return { userId: ctx.user_id || ctx.email, email: ctx.email, role: ctx.role };
+    return { userId: ctx.user_id || ctx.email, email: ctx.email, role: ctx.role, emailVerificationToken: ctx.emailVerificationToken };
   } catch {
     persistUser({
       email: data.email,

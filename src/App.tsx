@@ -38,6 +38,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
 import { readStoredUser, persistUser, clearUser, sendMagicLink, verifyMagicToken, type AuthUser, type AuthStatus } from './lib/auth';
+import ImpersonationBar from './components/ImpersonationBar';
 
 const PORTFOLIO_API = 'https://audio-portfolio-worker.torarnehave.workers.dev';
 const UPLOAD_API = 'https://norwegian-transcription-worker.torarnehave.workers.dev';
@@ -1347,8 +1348,10 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans p-4 md:p-8">
-      <div className="max-w-5xl mx-auto">
+    <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans">
+      {/* System Owner "Login as…" control + impersonation banner */}
+      <ImpersonationBar />
+      <div className="max-w-5xl mx-auto p-4 md:p-8">
         {/* Header */}
         <header className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-4">
