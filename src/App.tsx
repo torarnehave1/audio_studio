@@ -119,8 +119,10 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
     const fetchRecordings = async () => {
       try {
         setLoading(true);
-        // Fetch all recordings (Superadmin view, same as Agent Builder)
-        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&userRole=Superadmin&limit=200`);
+        // Role is resolved server-side from vegvisr_org.config by userEmail — the worker
+        // no longer trusts a client-supplied role (see audio-portfolio-worker/index.js fix:
+        // hardcoding Superadmin here used to leak every user's recordings to every caller).
+        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&limit=200`);
         if (!res.ok) throw new Error('Failed to fetch recordings');
         const data = await res.json();
         setRecordings(data.recordings || []);
