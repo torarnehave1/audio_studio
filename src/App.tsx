@@ -13,6 +13,7 @@ import {
   Scissors,
   Download,
   Upload,
+  Zap,
   Link as LinkIcon,
   Volume2,
   VolumeX,
@@ -676,6 +677,7 @@ export default function App() {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [clipName, setClipName] = useState('');
   const [clipCategory, setClipCategory] = useState('clip');
+  const [directUploadFile, setDirectUploadFile] = useState<File | null>(null);
 
   // Track 2 (overlay) state
   const waveformRef2 = useRef<HTMLDivElement>(null);
@@ -951,6 +953,32 @@ export default function App() {
       setAudioUrl(inputUrl);
       initWaveSurfer(inputUrl);
     }
+  };
+
+  // Reads just the duration from a file's metadata — fast (browser parses the container header
+  // only), unlike decodeAudioData which pulls the entire file into memory as raw PCM.
+  const getFileDuration = (file: File): Promise<number> =>
+    new Promise((resolve) => {
+      const audio = document.createElement('audio');
+      const url = URL.createObjectURL(file);
+      audio.preload = 'metadata';
+      audio.src = url;
+      audio.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(audio.duration || 0); };
+      audio.onerror = () => { URL.revokeObjectURL(url); resolve(0); };
+    });
+
+  // Direct-to-portfolio upload: skips the waveform editor entirely, so the file is never
+  // decoded to raw PCM and re-encoded to WAV first. For an already-compressed source (MP3, M4A)
+  // that re-encode was both slow (CPU-bound decode/encode on the whole file) and wasteful
+  // (uncompressed WAV runs 5-10x the size of the source) — this uploads the original bytes as-is.
+  const handleDirectFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setDirectUploadFile(file);
+    setClipName(file.name.replace(/\.[^.]+$/, ''));
+    setClipCategory('recording');
+    setShowSaveDialog(true);
+    e.target.value = '';
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1288,6 +1316,53 @@ export default function App() {
   };
 
   const saveClipToPortfolio = async () => {
+    if (directUploadFile) {
+      if (!authUser) return;
+      try {
+        setIsSaving(true);
+        setSaveMessage(null);
+        const file = directUploadFile;
+        const duration = await getFileDuration(file);
+        const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(
+          file, file.name, file.type || 'audio/mpeg', authUser.email
+        );
+        const recordingData = {
+          userEmail: authUser.email,
+          fileName: file.name,
+          displayName: clipName || file.name.replace(/\.[^.]+$/, ''),
+          fileSize: file.size,
+          duration: Math.round(duration),
+          r2Key,
+          r2Url,
+          transcriptionText: '',
+          category: clipCategory || 'recording',
+          tags: ['audio-studio', 'direct-upload'],
+          audioFormat: (file.name.split('.').pop() || 'mp3').toLowerCase(),
+          aiService: 'none',
+          aiModel: 'none',
+          processingTime: 0,
+        };
+        const metaRes = await fetch(`${PORTFOLIO_API}/save-recording`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-User-Email': authUser.email },
+          body: JSON.stringify(recordingData),
+        });
+        if (!metaRes.ok) throw new Error(`Save failed: ${metaRes.status}`);
+
+        setShowSaveDialog(false);
+        setDirectUploadFile(null);
+        setSaveMessage('Audio saved to portfolio!');
+        setTimeout(() => setSaveMessage(null), 3000);
+      } catch (err) {
+        console.error('Direct upload error:', err);
+        setSaveMessage(`Error: ${err instanceof Error ? err.message : 'Failed to save'}`);
+        setTimeout(() => setSaveMessage(null), 5000);
+      } finally {
+        setIsSaving(false);
+      }
+      return;
+    }
+
     if (!audioUrl || !wavesurfer.current || !authUser) return;
 
     try {
@@ -1505,7 +1580,7 @@ export default function App() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-              onClick={() => setShowSaveDialog(false)}
+              onClick={() => { setShowSaveDialog(false); setDirectUploadFile(null); }}
             >
               <motion.div
                 initial={{ scale: 0.95, opacity: 0 }}
@@ -1514,7 +1589,9 @@ export default function App() {
                 className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md"
                 onClick={(e) => e.stopPropagation()}
               >
-                <h3 className="text-lg font-bold mb-4">Save {activeRegion ? 'Clip' : 'Audio'} to Portfolio</h3>
+                <h3 className="text-lg font-bold mb-4">
+                  {directUploadFile ? 'Upload File to Portfolio' : `Save ${activeRegion ? 'Clip' : 'Audio'} to Portfolio`}
+                </h3>
                 <div className="space-y-3 mb-5">
                   <div>
                     <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Name</label>
@@ -1536,7 +1613,11 @@ export default function App() {
                       placeholder="e.g. clip, podcast, music"
                     />
                   </div>
-                  {activeRegion ? (
+                  {directUploadFile ? (
+                    <p className="text-xs text-zinc-400">
+                      {directUploadFile.name} &mdash; {(directUploadFile.size / (1024 * 1024)).toFixed(1)} MB, uploaded as-is (no re-encoding)
+                    </p>
+                  ) : activeRegion ? (
                     <p className="text-xs text-zinc-400">
                       Region: {Math.floor(activeRegion.start / 60)}:{(activeRegion.start % 60).toFixed(1).padStart(4, '0')} &ndash; {Math.floor(activeRegion.end / 60)}:{(activeRegion.end % 60).toFixed(1).padStart(4, '0')} ({(activeRegion.end - activeRegion.start).toFixed(1)}s)
                     </p>
@@ -1549,7 +1630,7 @@ export default function App() {
                 <div className="flex items-center gap-3 justify-end">
                   <button
                     type="button"
-                    onClick={() => setShowSaveDialog(false)}
+                    onClick={() => { setShowSaveDialog(false); setDirectUploadFile(null); }}
                     className="px-4 py-2 text-zinc-500 hover:text-zinc-700 text-sm font-medium"
                   >
                     Cancel
@@ -1606,6 +1687,18 @@ export default function App() {
                   </div>
                   <input type="file" className="hidden" accept="audio/*" onChange={handleFileUpload} />
                 </label>
+                {authUser && (
+                  <label
+                    className="mt-2 flex items-center justify-center w-full h-9 px-4 bg-amber-50 border-2 border-dashed border-amber-200 rounded-lg cursor-pointer hover:border-amber-400 hover:bg-amber-100/50 transition-all group"
+                    title="Upload straight to your portfolio — original file bytes, no waveform editing, no re-encoding to WAV. Much faster for large files."
+                  >
+                    <div className="flex items-center gap-2 text-amber-600 group-hover:text-amber-700">
+                      <Zap size={16} />
+                      <span className="text-xs font-medium">Quick upload to portfolio (no editing)</span>
+                    </div>
+                    <input type="file" className="hidden" accept="audio/*" onChange={handleDirectFileUpload} />
+                  </label>
+                )}
               </div>
 
               {/* Voice Recorder */}
