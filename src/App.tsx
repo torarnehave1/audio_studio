@@ -36,7 +36,9 @@ import {
   Square,
   ScissorsLineDashed,
   Layers,
-  Pencil
+  Pencil,
+  FileText,
+  Copy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
@@ -172,6 +174,7 @@ interface PortfolioRecording {
   r2Key?: string;
   tags?: string[];
   transcriptionExcerpt?: string;
+  transcriptionText?: string;
   publicationState?: string;
 }
 
@@ -201,6 +204,8 @@ const PortfolioBrowser = ({ email, onSelect }: {
   const [savingEdit, setSavingEdit] = useState(false);
   const [deletingRecording, setDeletingRecording] = useState<PortfolioRecording | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const [viewingTranscript, setViewingTranscript] = useState<PortfolioRecording | null>(null);
+  const [transcriptCopied, setTranscriptCopied] = useState(false);
 
   const fetchRecordings = useCallback(async () => {
     try {
@@ -480,6 +485,14 @@ const PortfolioBrowser = ({ email, onSelect }: {
                           {isSummarizing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
                         </button>
                         <button
+                          onClick={(e) => { e.stopPropagation(); if (rec.transcriptionText) { setTranscriptCopied(false); setViewingTranscript(rec); } }}
+                          disabled={!rec.transcriptionText}
+                          title={rec.transcriptionText ? 'View full transcript' : 'No transcript yet — generate a summary first'}
+                          className="p-1.5 text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-zinc-400"
+                        >
+                          <FileText size={14} />
+                        </button>
+                        <button
                           onClick={(e) => openEdit(rec, e)}
                           title="Edit name, category & tags"
                           className="p-1.5 text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
@@ -593,6 +606,53 @@ const PortfolioBrowser = ({ email, onSelect }: {
                 >
                   {deleteBusy ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
                   {deleteBusy ? 'Deleting...' : 'Delete'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Transcript viewer modal */}
+      <AnimatePresence>
+        {viewingTranscript && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+            onClick={() => setViewingTranscript(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-100 flex-shrink-0">
+                <div className="min-w-0">
+                  <h3 className="text-lg font-bold truncate">{viewingTranscript.displayName || 'Transcript'}</h3>
+                  <p className="text-xs text-zinc-400">Full transcript — generated via Whisper</p>
+                </div>
+                <button onClick={() => setViewingTranscript(null)} className="text-zinc-400 hover:text-zinc-600 flex-shrink-0 ml-4">
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="px-6 py-4 overflow-y-auto flex-1">
+                <p className="text-sm text-zinc-700 whitespace-pre-wrap leading-relaxed">{viewingTranscript.transcriptionText}</p>
+              </div>
+              <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-100 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(viewingTranscript.transcriptionText || '');
+                    setTranscriptCopied(true);
+                    setTimeout(() => setTranscriptCopied(false), 2000);
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-zinc-100 text-zinc-700 rounded-lg hover:bg-zinc-200 transition-colors text-sm font-medium"
+                >
+                  <Copy size={16} />
+                  {transcriptCopied ? 'Copied!' : 'Copy transcript'}
+                </button>
+                <button type="button" onClick={() => setViewingTranscript(null)} className="px-4 py-2 text-zinc-500 hover:text-zinc-700 text-sm font-medium">
+                  Close
                 </button>
               </div>
             </motion.div>
