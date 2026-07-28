@@ -35,7 +35,8 @@ import {
   MicOff,
   Square,
   ScissorsLineDashed,
-  Layers
+  Layers,
+  Pencil
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { audioBufferToWav } from './utils/audio';
@@ -56,7 +57,8 @@ async function uploadAudioToR2Chunked(
   blob: Blob,
   fileName: string,
   contentType: string,
-  userEmail: string
+  userEmail: string,
+  onProgress?: (percent: number) => void
 ): Promise<{ r2Key: string; audioUrl: string | null }> {
   const initRes = await fetch(`${UPLOAD_API}/upload/init`, {
     method: 'POST',
@@ -72,6 +74,7 @@ async function uploadAudioToR2Chunked(
   const totalParts = Math.max(1, Math.ceil(blob.size / chunkSize));
 
   try {
+    onProgress?.(0);
     for (let partNumber = 1; partNumber <= totalParts; partNumber += 1) {
       const start = (partNumber - 1) * chunkSize;
       const chunk = blob.slice(start, Math.min(blob.size, start + chunkSize));
@@ -86,6 +89,7 @@ async function uploadAudioToR2Chunked(
         throw new Error(partData.error || `Upload part ${partNumber} failed with status ${partRes.status}`);
       }
       parts.push({ partNumber: Number(partData.part.partNumber), etag: String(partData.part.etag) });
+      onProgress?.(Math.round((partNumber / totalParts) * 100));
     }
 
     const completeRes = await fetch(`${UPLOAD_API}/upload/complete`, {
@@ -168,28 +172,68 @@ interface PortfolioRecording {
   r2Key?: string;
   tags?: string[];
   transcriptionExcerpt?: string;
+  publicationState?: string;
 }
 
-/* ── Portfolio Browser Panel ── */
-const PortfolioBrowser = ({ email, onSelect, onClose }: {
+/* ── Portfolio Tab: full-width table with CRUD ── */
+type SortKey = 'name' | 'date' | 'duration';
+type SummaryStage = 'transcribing' | 'summarizing' | null;
+
+const PortfolioBrowser = ({ email, onSelect }: {
   email: string;
   onSelect: (rec: PortfolioRecording) => void;
-  onClose: () => void;
 }) => {
   const [recordings, setRecordings] = useState<PortfolioRecording[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [sortKey, setSortKey] = useState<SortKey>('date');
+  const [sortDesc, setSortDesc] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [summarizingId, setSummarizingId] = useState<string | null>(null);
+  const [summaryStage, setSummaryStage] = useState<SummaryStage>(null);
   const [summaryError, setSummaryError] = useState<Record<string, string>>({});
+  const [editingRecording, setEditingRecording] = useState<PortfolioRecording | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editCategory, setEditCategory] = useState('');
+  const [editTags, setEditTags] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [deletingRecording, setDeletingRecording] = useState<PortfolioRecording | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const fetchRecordings = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      // Role is resolved server-side from vegvisr_org.config by userEmail — the worker
+      // no longer trusts a client-supplied role (see audio-portfolio-worker/index.js fix:
+      // hardcoding Superadmin here used to leak every user's recordings to every caller).
+      const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&limit=200`);
+      if (!res.ok) throw new Error('Failed to fetch recordings');
+      const data = await res.json();
+      setRecordings(data.recordings || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load portfolio');
+    } finally {
+      setLoading(false);
+    }
+  }, [email]);
+
+  useEffect(() => { fetchRecordings(); }, [fetchRecordings]);
 
   // Transcribes (Whisper, cached on repeat calls) and generates a summary/keywords/category
   // via Claude Haiku, then patches the recording in place so the list reflects it immediately.
+  // The backend does this as one blocking call with no incremental progress, so the UI cycles
+  // through honest stage labels ("Transcribing…" → "Generating summary…") instead of a bare
+  // spinner or a fabricated percentage.
   const generateSummary = async (rec: PortfolioRecording, e: React.MouseEvent) => {
     e.stopPropagation();
     const recordingId = rec.recordingId || rec.id;
     setSummarizingId(recordingId);
+    setSummaryStage(rec.transcriptionExcerpt ? 'summarizing' : 'transcribing');
     setSummaryError((prev) => { const n = { ...prev }; delete n[recordingId]; return n; });
+    const stageTimer = rec.transcriptionExcerpt ? null : setTimeout(() => setSummaryStage('summarizing'), 4000);
     try {
       const res = await fetch(`${PORTFOLIO_API}/generate-summary`, {
         method: 'POST',
@@ -206,34 +250,92 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
     } catch (err) {
       setSummaryError((prev) => ({ ...prev, [recordingId]: err instanceof Error ? err.message : 'Failed to generate summary' }));
     } finally {
+      if (stageTimer) clearTimeout(stageTimer);
       setSummarizingId(null);
+      setSummaryStage(null);
     }
   };
 
-  useEffect(() => {
-    const fetchRecordings = async () => {
-      try {
-        setLoading(true);
-        // Role is resolved server-side from vegvisr_org.config by userEmail — the worker
-        // no longer trusts a client-supplied role (see audio-portfolio-worker/index.js fix:
-        // hardcoding Superadmin here used to leak every user's recordings to every caller).
-        const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&limit=200`);
-        if (!res.ok) throw new Error('Failed to fetch recordings');
-        const data = await res.json();
-        setRecordings(data.recordings || []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load portfolio');
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchRecordings();
-  }, [email]);
+  const openEdit = (rec: PortfolioRecording, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setEditingRecording(rec);
+    setEditName(rec.displayName || '');
+    setEditCategory(rec.category || '');
+    setEditTags((rec.tags || []).join(', '));
+  };
 
-  const filtered = recordings.filter(r =>
-    r.displayName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    r.category?.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const saveEdit = async () => {
+    if (!editingRecording) return;
+    const recordingId = editingRecording.recordingId || editingRecording.id;
+    setSavingEdit(true);
+    try {
+      const tags = editTags.split(',').map((t) => t.trim()).filter(Boolean);
+      const res = await fetch(
+        `${PORTFOLIO_API}/update-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ displayName: editName.trim(), category: editCategory.trim(), tags }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed with status ${res.status}`);
+      setRecordings((prev) => prev.map((r) =>
+        (r.recordingId || r.id) === recordingId
+          ? { ...r, displayName: editName.trim(), category: editCategory.trim(), tags }
+          : r
+      ));
+      setEditingRecording(null);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to save changes');
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deletingRecording) return;
+    const recordingId = deletingRecording.recordingId || deletingRecording.id;
+    setDeleteBusy(true);
+    const previous = recordings;
+    setRecordings((prev) => prev.filter((r) => (r.recordingId || r.id) !== recordingId));
+    try {
+      const res = await fetch(
+        `${PORTFOLIO_API}/delete-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
+        { method: 'DELETE' }
+      );
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed with status ${res.status}`);
+      setDeletingRecording(null);
+    } catch (err) {
+      setRecordings(previous); // rollback optimistic removal
+      alert(err instanceof Error ? err.message : 'Failed to delete recording');
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  const categories = Array.from(new Set(recordings.map((r) => r.category).filter(Boolean))).sort();
+
+  const filtered = recordings
+    .filter((r) =>
+      (r.displayName?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        r.category?.toLowerCase().includes(searchTerm.toLowerCase())) &&
+      (!categoryFilter || r.category === categoryFilter) &&
+      (!statusFilter || r.publicationState === statusFilter)
+    )
+    .sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'name') cmp = (a.displayName || '').localeCompare(b.displayName || '');
+      else if (sortKey === 'duration') cmp = (a.duration || 0) - (b.duration || 0);
+      else cmp = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      return sortDesc ? -cmp : cmp;
+    });
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDesc((d) => !d);
+    else { setSortKey(key); setSortDesc(true); }
+  };
 
   const formatDuration = (sec: number) => {
     if (!sec) return '--:--';
@@ -242,96 +344,261 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
     return `${m}:${s.toString().padStart(2, '0')}`;
   };
 
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: -10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -10 }}
-      className="bg-white border border-zinc-200 rounded-2xl shadow-lg p-5"
+  const SortHeader = ({ label, sortKeyName }: { label: string; sortKeyName: SortKey }) => (
+    <button
+      onClick={() => toggleSort(sortKeyName)}
+      className="flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider text-zinc-400 hover:text-zinc-600"
     >
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-600 flex items-center gap-2">
-          <FolderOpen size={16} className="text-indigo-500" />
-          My Portfolio Recordings
-        </h3>
-        <button onClick={onClose} className="text-zinc-400 hover:text-zinc-600 transition-colors" title="Close portfolio">
-          <X size={18} />
-        </button>
+      {label}
+      {sortKey === sortKeyName && <span className="text-indigo-500">{sortDesc ? '↓' : '↑'}</span>}
+    </button>
+  );
+
+  return (
+    <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}>
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <div className="relative flex-1 min-w-[220px]">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={15} />
+          <input
+            type="text"
+            placeholder="Search recordings..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="w-full pl-9 pr-4 py-2 bg-white border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+          />
+        </div>
+        <select
+          value={categoryFilter}
+          onChange={(e) => setCategoryFilter(e.target.value)}
+          className="px-2.5 py-2 bg-white border border-zinc-200 rounded-lg text-sm text-zinc-600"
+        >
+          <option value="">All categories</option>
+          {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="px-2.5 py-2 bg-white border border-zinc-200 rounded-lg text-sm text-zinc-600"
+        >
+          <option value="">All statuses</option>
+          <option value="draft">Draft</option>
+          <option value="published">Published</option>
+        </select>
       </div>
 
-      <div className="relative mb-3">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={16} />
-        <input
-          type="text"
-          placeholder="Search recordings..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          className="w-full pl-9 pr-4 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
-        />
+      <div className="bg-white border border-zinc-200 rounded-2xl shadow-sm overflow-hidden">
+        {loading && (
+          <div className="flex items-center justify-center py-14">
+            <Loader2 size={20} className="animate-spin text-indigo-500" />
+            <span className="ml-2 text-sm text-zinc-500">Loading recordings...</span>
+          </div>
+        )}
+
+        {error && !loading && (
+          <div className="text-center py-10 text-red-500 text-sm">{error}</div>
+        )}
+
+        {!loading && !error && filtered.length === 0 && (
+          <div className="text-center py-14 text-zinc-400 text-sm">
+            <FolderOpen size={28} className="mx-auto mb-2 text-zinc-300" />
+            {recordings.length === 0 ? 'No recordings in your portfolio yet — upload your first file.' : 'No recordings match your filters.'}
+          </div>
+        )}
+
+        {!loading && !error && filtered.length > 0 && (
+          <>
+            <div className="hidden sm:grid grid-cols-[1fr_120px_90px_110px_150px] gap-3 px-4 py-2.5 bg-zinc-50 border-b border-zinc-200">
+              <SortHeader label="Title" sortKeyName="name" />
+              <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400">Category</span>
+              <SortHeader label="Duration" sortKeyName="duration" />
+              <SortHeader label="Date" sortKeyName="date" />
+              <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400 text-right">Actions</span>
+            </div>
+            <div className="divide-y divide-zinc-100">
+              {filtered.map((rec) => {
+                const recordingId = rec.recordingId || rec.id;
+                const isSummarizing = summarizingId === recordingId;
+                return (
+                  <div key={recordingId} className="hover:bg-zinc-50 transition-colors">
+                    <div className="grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_120px_90px_110px_150px] gap-3 items-start px-4 py-3">
+                      <div className="flex items-start gap-3 min-w-0">
+                        <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 flex-shrink-0 mt-0.5">
+                          <Music size={14} />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => onSelect(rec)}
+                              className="text-sm font-medium text-zinc-800 hover:text-indigo-600 hover:underline truncate max-w-[240px] text-left"
+                              title="Load in editor"
+                            >
+                              {rec.displayName || rec.id}
+                            </button>
+                            <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full flex-shrink-0 ${
+                              rec.publicationState === 'published' ? 'bg-emerald-50 text-emerald-600' : 'bg-zinc-100 text-zinc-500'
+                            }`}>
+                              {rec.publicationState || 'draft'}
+                            </span>
+                          </div>
+                          {isSummarizing ? (
+                            <p className="text-xs text-purple-600 flex items-center gap-1.5 mt-0.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
+                              {summaryStage === 'transcribing'
+                                ? 'Transcribing audio (long recordings can take a minute or two)…'
+                                : 'Generating summary…'}
+                            </p>
+                          ) : rec.transcriptionExcerpt ? (
+                            <p className="text-xs text-zinc-500 italic mt-0.5 line-clamp-2" title={rec.transcriptionExcerpt}>
+                              {rec.transcriptionExcerpt}
+                              {rec.tags && rec.tags.length > 0 && (
+                                <span className="ml-1 not-italic text-zinc-400">— {rec.tags.join(', ')}</span>
+                              )}
+                            </p>
+                          ) : null}
+                          {summaryError[recordingId] && (
+                            <p className="text-xs text-red-500 mt-0.5">{summaryError[recordingId]}</p>
+                          )}
+                          <p className="sm:hidden text-xs text-zinc-400 mt-0.5">
+                            {rec.category || 'Uncategorized'} &middot; {formatDuration(rec.duration)} &middot; {new Date(rec.createdAt).toLocaleDateString()}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="hidden sm:block pt-0.5">
+                        <span className="text-xs font-medium px-2 py-1 rounded-md bg-zinc-100 text-zinc-500 whitespace-nowrap">
+                          {rec.category || 'Uncategorized'}
+                        </span>
+                      </div>
+                      <div className="hidden sm:block pt-1.5 text-xs text-zinc-500 tabular-nums">{formatDuration(rec.duration)}</div>
+                      <div className="hidden sm:block pt-1.5 text-xs text-zinc-500 tabular-nums">{new Date(rec.createdAt).toLocaleDateString()}</div>
+                      <div className="flex items-center justify-end gap-0.5 -mt-1">
+                        <button
+                          onClick={(e) => generateSummary(rec, e)}
+                          disabled={isSummarizing}
+                          title="Generate summary, keywords & category (Whisper + AI)"
+                          className="p-1.5 text-zinc-400 hover:text-purple-600 hover:bg-purple-50 rounded-lg transition-colors disabled:opacity-40"
+                        >
+                          {isSummarizing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                        </button>
+                        <button
+                          onClick={(e) => openEdit(rec, e)}
+                          title="Edit name, category & tags"
+                          className="p-1.5 text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        {rec.r2Url && (
+                          <a
+                            href={rec.r2Url}
+                            download
+                            onClick={(e) => e.stopPropagation()}
+                            title="Download"
+                            className="p-1.5 text-zinc-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+                          >
+                            <Download size={14} />
+                          </a>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setDeletingRecording(rec); }}
+                          title="Delete"
+                          className="p-1.5 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
       </div>
 
-      {loading && (
-        <div className="flex items-center justify-center py-8">
-          <Loader2 size={20} className="animate-spin text-indigo-500" />
-          <span className="ml-2 text-sm text-zinc-500">Loading recordings...</span>
-        </div>
-      )}
-
-      {error && (
-        <div className="text-center py-6 text-red-500 text-sm">{error}</div>
-      )}
-
-      {!loading && !error && filtered.length === 0 && (
-        <div className="text-center py-6 text-zinc-400 text-sm">
-          {recordings.length === 0 ? 'No recordings in your portfolio yet.' : 'No recordings match your search.'}
-        </div>
-      )}
-
-      {!loading && !error && filtered.length > 0 && (
-        <div className="max-h-64 overflow-y-auto space-y-1">
-          {filtered.map((rec) => {
-            const recordingId = rec.recordingId || rec.id;
-            const isSummarizing = summarizingId === recordingId;
-            return (
-              <div key={recordingId} className="rounded-lg hover:bg-indigo-50 transition-colors">
-                <div className="w-full flex items-center gap-3 px-3 py-2.5 text-left group">
-                  <button onClick={() => onSelect(rec)} className="flex items-center gap-3 flex-1 min-w-0 text-left">
-                    <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 group-hover:bg-indigo-200 transition-colors flex-shrink-0">
-                      <Music size={14} />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-zinc-800 truncate">{rec.displayName || rec.id}</p>
-                      <p className="text-xs text-zinc-400">
-                        {rec.category || 'Uncategorized'} &middot; {formatDuration(rec.duration)} &middot; {new Date(rec.createdAt).toLocaleDateString()}
-                      </p>
-                    </div>
-                  </button>
-                  <button
-                    onClick={(e) => generateSummary(rec, e)}
-                    disabled={isSummarizing}
-                    title="Generate summary, keywords & category (Whisper + AI)"
-                    className="p-1.5 text-zinc-400 hover:text-purple-600 hover:bg-purple-50 rounded-lg transition-colors disabled:opacity-40 flex-shrink-0"
-                  >
-                    {isSummarizing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-                  </button>
-                  <ChevronRight size={16} className="text-zinc-300 group-hover:text-indigo-400 transition-colors flex-shrink-0" />
+      {/* Edit modal */}
+      <AnimatePresence>
+        {editingRecording && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+            onClick={() => setEditingRecording(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-lg font-bold mb-1">Edit Recording</h3>
+              <p className="text-xs text-zinc-400 mb-4">Updates name, category, and tags for this recording.</p>
+              <div className="space-y-3 mb-5">
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Name</label>
+                  <input
+                    type="text" value={editName} onChange={(e) => setEditName(e.target.value)}
+                    className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
                 </div>
-                {rec.transcriptionExcerpt && (
-                  <p className="px-3 pb-2 -mt-1 text-xs text-zinc-500 italic">
-                    {rec.transcriptionExcerpt}
-                    {rec.tags && rec.tags.length > 0 && (
-                      <span className="ml-1 not-italic text-zinc-400">— {rec.tags.join(', ')}</span>
-                    )}
-                  </p>
-                )}
-                {summaryError[recordingId] && (
-                  <p className="px-3 pb-2 -mt-1 text-xs text-red-500">{summaryError[recordingId]}</p>
-                )}
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Category</label>
+                  <input
+                    type="text" value={editCategory} onChange={(e) => setEditCategory(e.target.value)}
+                    className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Tags (comma-separated)</label>
+                  <input
+                    type="text" value={editTags} onChange={(e) => setEditTags(e.target.value)}
+                    className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
+                </div>
               </div>
-            );
-          })}
-        </div>
-      )}
+              <div className="flex items-center gap-3 justify-end">
+                <button type="button" onClick={() => setEditingRecording(null)} className="px-4 py-2 text-zinc-500 hover:text-zinc-700 text-sm font-medium">Cancel</button>
+                <button
+                  type="button" onClick={saveEdit} disabled={savingEdit}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium disabled:opacity-50"
+                >
+                  {savingEdit ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                  {savingEdit ? 'Saving...' : 'Save changes'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete confirm modal */}
+      <AnimatePresence>
+        {deletingRecording && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+            onClick={() => setDeletingRecording(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-sm"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-lg font-bold mb-2">Delete recording?</h3>
+              <p className="text-sm text-zinc-500 mb-5">
+                Delete <span className="font-semibold text-zinc-700">"{deletingRecording.displayName || deletingRecording.id}"</span>?
+                This removes it from your portfolio and cannot be undone.
+              </p>
+              <div className="flex items-center gap-3 justify-end">
+                <button type="button" onClick={() => setDeletingRecording(null)} className="px-4 py-2 text-zinc-500 hover:text-zinc-700 text-sm font-medium">Cancel</button>
+                <button
+                  type="button" onClick={confirmDelete} disabled={deleteBusy}
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors text-sm font-medium disabled:opacity-50"
+                >
+                  {deleteBusy ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+                  {deleteBusy ? 'Deleting...' : 'Delete'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 };
@@ -721,14 +988,17 @@ export default function App() {
   const [loginMessage, setLoginMessage] = useState('');
   const [loginError, setLoginError] = useState('');
 
+  // Top-level tab: Editor (waveform + upload) or Portfolio (own full-width view)
+  const [activeTab, setActiveTab] = useState<'editor' | 'portfolio'>('editor');
+
   // Portfolio state
-  const [showPortfolio, setShowPortfolio] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [loadedRecordingId, setLoadedRecordingId] = useState<string | null>(null);
   const [loadedRecordingName, setLoadedRecordingName] = useState<string | null>(null);
 
   // Save dialog state
   const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [clipName, setClipName] = useState('');
   const [clipCategory, setClipCategory] = useState('clip');
   const [directUploadFile, setDirectUploadFile] = useState<File | null>(null);
@@ -788,7 +1058,7 @@ export default function App() {
     clearUser();
     setAuthUser(null);
     setAuthStatus('anonymous');
-    setShowPortfolio(false);
+    setActiveTab('editor');
   };
 
   const handlePortfolioSelect = (rec: PortfolioRecording) => {
@@ -798,7 +1068,7 @@ export default function App() {
       setLoadedRecordingId(rec.recordingId || rec.id);
       setLoadedRecordingName(rec.displayName || 'Untitled');
       initWaveSurfer(url);
-      setShowPortfolio(false);
+      setActiveTab('editor');
     } else {
       setError('This portfolio recording has no playable audio URL. Try saving it again from Audio Portfolio.');
     }
@@ -1375,10 +1645,11 @@ export default function App() {
       try {
         setIsSaving(true);
         setSaveMessage(null);
+        setUploadProgress(0);
         const file = directUploadFile;
         const duration = await getFileDuration(file);
         const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(
-          file, file.name, file.type || 'audio/mpeg', authUser.email
+          file, file.name, file.type || 'audio/mpeg', authUser.email, setUploadProgress
         );
         const recordingData = {
           userEmail: authUser.email,
@@ -1413,6 +1684,7 @@ export default function App() {
         setTimeout(() => setSaveMessage(null), 5000);
       } finally {
         setIsSaving(false);
+        setUploadProgress(null);
       }
       return;
     }
@@ -1422,6 +1694,7 @@ export default function App() {
     try {
       setIsSaving(true);
       setSaveMessage(null);
+      setUploadProgress(0);
 
       const response = await fetch(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
@@ -1485,7 +1758,7 @@ export default function App() {
       // Upload WAV to R2 — chunked so it lands in the founder's own bucket when configured
       // (vegvisr_org.config) without hitting the per-request body size limit on large files.
       const fileName = `${activeRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
-      const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(wavBlob, fileName, 'audio/wav', authUser.email);
+      const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(wavBlob, fileName, 'audio/wav', authUser.email, setUploadProgress);
 
       // Save metadata to portfolio
       const tags = [activeRegion ? 'clip' : 'full-audio', 'audio-studio'];
@@ -1528,6 +1801,7 @@ export default function App() {
       setTimeout(() => setSaveMessage(null), 5000);
     } finally {
       setIsSaving(false);
+      setUploadProgress(null);
     }
   };
 
@@ -1538,7 +1812,7 @@ export default function App() {
       <DeployBadge />
       <div className="max-w-5xl mx-auto p-4 md:p-8">
         {/* Header */}
-        <header className="mb-8 flex items-center justify-between">
+        <header className="mb-8 flex items-center justify-between flex-wrap gap-4">
           <div className="flex items-center gap-4">
             <img
               src="https://favicons.vegvisr.org/favicons/1772389497421-1-1772573382892-512x512.png"
@@ -1553,6 +1827,30 @@ export default function App() {
             </div>
           </div>
 
+          {authStatus === 'authed' && authUser && (
+            <div className="flex items-center gap-0.5 bg-zinc-100 border border-zinc-200 rounded-xl p-1">
+              <button
+                type="button"
+                onClick={() => setActiveTab('editor')}
+                className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${
+                  activeTab === 'editor' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'
+                }`}
+              >
+                Editor
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('portfolio')}
+                className={`flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${
+                  activeTab === 'portfolio' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'
+                }`}
+              >
+                <FolderOpen size={14} />
+                Portfolio
+              </button>
+            </div>
+          )}
+
           {/* Auth Controls */}
           <div className="flex items-center gap-3">
             {authStatus === 'checking' && (
@@ -1562,14 +1860,6 @@ export default function App() {
             )}
             {authStatus === 'authed' && authUser && (
               <>
-                <button
-                  type="button"
-                  onClick={() => setShowPortfolio(!showPortfolio)}
-                  className="flex items-center gap-2 px-3 py-2 bg-indigo-50 text-indigo-700 rounded-lg hover:bg-indigo-100 transition-colors text-sm font-medium"
-                >
-                  <FolderOpen size={16} />
-                  Portfolio
-                </button>
                 <span className="text-xs text-zinc-500">{authUser.email}</span>
                 <button
                   type="button"
@@ -1680,6 +1970,19 @@ export default function App() {
                       Full audio &mdash; {Math.floor(duration / 60)}:{(duration % 60).toFixed(1).padStart(4, '0')} ({duration.toFixed(1)}s)
                     </p>
                   )}
+                  {isSaving && uploadProgress !== null && (
+                    <div>
+                      <div className="h-1.5 rounded-full bg-zinc-100 overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-indigo-600 to-purple-600 transition-all duration-200"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      </div>
+                      <p className="text-xs text-zinc-400 mt-1 tabular-nums">
+                        {uploadProgress < 100 ? `Uploading… ${uploadProgress}%` : 'Finishing up…'}
+                      </p>
+                    </div>
+                  )}
                 </div>
                 <div className="flex items-center gap-3 justify-end">
                   <button
@@ -1696,7 +1999,7 @@ export default function App() {
                     className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors text-sm font-medium disabled:opacity-50"
                   >
                     {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                    {isSaving ? 'Saving...' : 'Save'}
+                    {isSaving ? (uploadProgress !== null ? `Uploading… ${uploadProgress}%` : 'Saving...') : 'Save'}
                   </button>
                 </div>
               </motion.div>
@@ -1705,6 +2008,10 @@ export default function App() {
         </AnimatePresence>
 
         <main className="grid gap-6">
+        {activeTab === 'portfolio' && authUser ? (
+          <PortfolioBrowser email={authUser.email} onSelect={handlePortfolioSelect} />
+        ) : (
+          <>
           {/* Input Section */}
           <section className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm">
             <div className="grid md:grid-cols-3 gap-6">
@@ -1763,17 +2070,6 @@ export default function App() {
               />
             </div>
           </section>
-
-          {/* Portfolio Browser */}
-          <AnimatePresence>
-            {showPortfolio && authUser && (
-              <PortfolioBrowser
-                email={authUser.email}
-                onSelect={handlePortfolioSelect}
-                onClose={() => setShowPortfolio(false)}
-              />
-            )}
-          </AnimatePresence>
 
           {/* Waveform Section */}
           <section className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm min-h-[300px] flex flex-col overflow-hidden">
@@ -1993,6 +2289,8 @@ export default function App() {
               </p>
             </div>
           </section>
+          </>
+        )}
         </main>
 
         <footer className="mt-12 text-center text-zinc-400 text-xs">
