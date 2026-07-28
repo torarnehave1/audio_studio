@@ -14,6 +14,7 @@ import {
   Download,
   Upload,
   Zap,
+  Sparkles,
   Link as LinkIcon,
   Volume2,
   VolumeX,
@@ -166,6 +167,7 @@ interface PortfolioRecording {
   r2Url?: string;
   r2Key?: string;
   tags?: string[];
+  transcriptionExcerpt?: string;
 }
 
 /* ── Portfolio Browser Panel ── */
@@ -178,6 +180,35 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [summarizingId, setSummarizingId] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState<Record<string, string>>({});
+
+  // Transcribes (Whisper, cached on repeat calls) and generates a summary/keywords/category
+  // via Claude Haiku, then patches the recording in place so the list reflects it immediately.
+  const generateSummary = async (rec: PortfolioRecording, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const recordingId = rec.recordingId || rec.id;
+    setSummarizingId(recordingId);
+    setSummaryError((prev) => { const n = { ...prev }; delete n[recordingId]; return n; });
+    try {
+      const res = await fetch(`${PORTFOLIO_API}/generate-summary`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userEmail: email, recordingId }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed with status ${res.status}`);
+      setRecordings((prev) => prev.map((r) =>
+        (r.recordingId || r.id) === recordingId
+          ? { ...r, category: data.category, tags: data.keywords, transcriptionExcerpt: data.summary }
+          : r
+      ));
+    } catch (err) {
+      setSummaryError((prev) => ({ ...prev, [recordingId]: err instanceof Error ? err.message : 'Failed to generate summary' }));
+    } finally {
+      setSummarizingId(null);
+    }
+  };
 
   useEffect(() => {
     const fetchRecordings = async () => {
@@ -258,24 +289,47 @@ const PortfolioBrowser = ({ email, onSelect, onClose }: {
 
       {!loading && !error && filtered.length > 0 && (
         <div className="max-h-64 overflow-y-auto space-y-1">
-          {filtered.map((rec) => (
-            <button
-              key={rec.recordingId || rec.id}
-              onClick={() => onSelect(rec)}
-              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-indigo-50 transition-colors text-left group"
-            >
-              <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 group-hover:bg-indigo-200 transition-colors">
-                <Music size={14} />
+          {filtered.map((rec) => {
+            const recordingId = rec.recordingId || rec.id;
+            const isSummarizing = summarizingId === recordingId;
+            return (
+              <div key={recordingId} className="rounded-lg hover:bg-indigo-50 transition-colors">
+                <div className="w-full flex items-center gap-3 px-3 py-2.5 text-left group">
+                  <button onClick={() => onSelect(rec)} className="flex items-center gap-3 flex-1 min-w-0 text-left">
+                    <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 group-hover:bg-indigo-200 transition-colors flex-shrink-0">
+                      <Music size={14} />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-zinc-800 truncate">{rec.displayName || rec.id}</p>
+                      <p className="text-xs text-zinc-400">
+                        {rec.category || 'Uncategorized'} &middot; {formatDuration(rec.duration)} &middot; {new Date(rec.createdAt).toLocaleDateString()}
+                      </p>
+                    </div>
+                  </button>
+                  <button
+                    onClick={(e) => generateSummary(rec, e)}
+                    disabled={isSummarizing}
+                    title="Generate summary, keywords & category (Whisper + AI)"
+                    className="p-1.5 text-zinc-400 hover:text-purple-600 hover:bg-purple-50 rounded-lg transition-colors disabled:opacity-40 flex-shrink-0"
+                  >
+                    {isSummarizing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                  </button>
+                  <ChevronRight size={16} className="text-zinc-300 group-hover:text-indigo-400 transition-colors flex-shrink-0" />
+                </div>
+                {rec.transcriptionExcerpt && (
+                  <p className="px-3 pb-2 -mt-1 text-xs text-zinc-500 italic">
+                    {rec.transcriptionExcerpt}
+                    {rec.tags && rec.tags.length > 0 && (
+                      <span className="ml-1 not-italic text-zinc-400">— {rec.tags.join(', ')}</span>
+                    )}
+                  </p>
+                )}
+                {summaryError[recordingId] && (
+                  <p className="px-3 pb-2 -mt-1 text-xs text-red-500">{summaryError[recordingId]}</p>
+                )}
               </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-zinc-800 truncate">{rec.displayName || rec.id}</p>
-                <p className="text-xs text-zinc-400">
-                  {rec.category || 'Uncategorized'} &middot; {formatDuration(rec.duration)} &middot; {new Date(rec.createdAt).toLocaleDateString()}
-                </p>
-              </div>
-              <ChevronRight size={16} className="text-zinc-300 group-hover:text-indigo-400 transition-colors" />
-            </button>
-          ))}
+            );
+          })}
         </div>
       )}
     </motion.div>
