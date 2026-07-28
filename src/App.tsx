@@ -1127,8 +1127,11 @@ export default function App() {
       setAudioUrl(url);
       setLoadedRecordingId(rec.recordingId || rec.id);
       setLoadedRecordingName(rec.displayName || 'Untitled');
-      initWaveSurfer(url);
+      // Switching tabs first mounts the waveform container; initWaveSurfer needs that DOM
+      // node to exist (it no-ops silently if waveformRef.current is null), so it must run
+      // AFTER React commits the Editor tab's markup, not before — hence the rAF deferral.
       setActiveTab('editor');
+      requestAnimationFrame(() => initWaveSurfer(url));
     } else {
       setError('This portfolio recording has no playable audio URL. Try saving it again from Audio Portfolio.');
     }
