@@ -208,6 +208,29 @@ const recordingAudioUrl = (
   return rec.audioUrl || rec.r2Url || null;
 };
 
+/**
+ * audio.vegvisr.org only sends Access-Control-Allow-Origin when the request has an Origin
+ * header, and its responses are cacheable for 4 h without `Vary: Origin` on the header-less
+ * variant. Any no-CORS load of a file from a vegvisr.org page (a plain <audio>, the download
+ * link, the player on www.vegvisr.org) therefore leaves a cache entry that makes a later CORS
+ * fetch of the same URL fail. `cache: 'reload'` skips that entry and replaces it with a
+ * CORS-valid one.
+ */
+const AUDIO_FETCH_PARAMS: RequestInit = { cache: 'reload' };
+const audioFetchParams = (url: string): RequestInit | undefined =>
+  /^https?:/i.test(url) ? AUDIO_FETCH_PARAMS : undefined;
+
+/** fetch() for audio bytes: uses the cache when it can, and goes around it when it is poisoned. */
+const fetchAudio = async (url: string): Promise<Response> => {
+  try {
+    return await fetch(url);
+  } catch (err) {
+    const params = audioFetchParams(url);
+    if (!params) throw err;
+    return fetch(url, params);
+  }
+};
+
 /* ── Portfolio Tab: full-width table with CRUD ── */
 type SortKey = 'name' | 'date' | 'duration';
 type SummaryStage = 'transcribing' | 'summarizing' | null;
@@ -259,6 +282,11 @@ const PortfolioBrowser = ({ email, onSelect }: {
       };
       // A single unreachable or slow file must not stall the queue behind it.
       const timer = setTimeout(() => finish(0), 30000);
+      // Without crossOrigin the request carries no Origin header, audio.vegvisr.org then omits
+      // Access-Control-Allow-Origin, and Chrome caches THAT response (max-age 4 h, no Vary).
+      // The editor's later CORS fetch of the same URL is answered from that cache entry and
+      // blocked — "Failed to load audio" for every recording this probe had touched.
+      el.crossOrigin = 'anonymous';
       el.preload = 'metadata';
       el.onloadedmetadata = () => finish(Number.isFinite(el.duration) ? el.duration : 0);
       el.onerror = () => finish(0);
@@ -1351,7 +1379,7 @@ export default function App() {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
 
       // Decode existing audio
-      const existingResponse = await fetch(audioUrl);
+      const existingResponse = await fetchAudio(audioUrl);
       const existingArrayBuffer = await existingResponse.arrayBuffer();
       const existingBuffer = await audioCtx.decodeAudioData(existingArrayBuffer);
 
@@ -1443,6 +1471,7 @@ export default function App() {
       height: 128,
       normalize: true,
       url: url,
+      fetchParams: audioFetchParams(url),
       minPxPerSec: 10,
       autoCenter: true,
     });
@@ -1510,6 +1539,7 @@ export default function App() {
       height: 80,
       normalize: true,
       url: url,
+      fetchParams: audioFetchParams(url),
       minPxPerSec: 10,
       autoCenter: true,
     });
@@ -1771,7 +1801,7 @@ export default function App() {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
 
       // Decode Track 1
-      const response = await fetch(audioUrl);
+      const response = await fetchAudio(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
@@ -1798,7 +1828,7 @@ export default function App() {
 
       // Mix with Track 2 if loaded
       if (track2Url) {
-        const res2 = await fetch(track2Url);
+        const res2 = await fetchAudio(track2Url);
         const ab2 = await res2.arrayBuffer();
         const buf2Full = await audioCtx.decodeAudioData(ab2);
 
@@ -1848,7 +1878,7 @@ export default function App() {
       setIsCutting(true);
 
       // 1. Fetch and decode the full audio
-      const response = await fetch(audioUrl);
+      const response = await fetchAudio(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -1960,7 +1990,7 @@ export default function App() {
       setSaveMessage(null);
       setUploadProgress(0);
 
-      const response = await fetch(audioUrl);
+      const response = await fetchAudio(audioUrl);
       const arrayBuffer = await response.arrayBuffer();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -1968,7 +1998,7 @@ export default function App() {
       // Optionally decode Track 2 for mixing
       let track2Buffer: AudioBuffer | null = null;
       if (track2Url) {
-        const res2 = await fetch(track2Url);
+        const res2 = await fetchAudio(track2Url);
         const ab2 = await res2.arrayBuffer();
         track2Buffer = await audioCtx.decodeAudioData(ab2);
       }
