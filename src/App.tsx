@@ -1475,7 +1475,16 @@ export default function App() {
 
     ws.on('error', (err) => {
       console.error('WaveSurfer error:', err);
-      setError('Failed to load audio. Please check the URL or file format.');
+      // A superseded instance is destroyed mid-load and reports that as an AbortError; that is
+      // not a failure of the audio now on screen, so it must not paint an error over it.
+      if (wavesurfer.current !== ws) return;
+      // Show the underlying cause: "check the URL or file format" alone cannot tell a network
+      // or CORS failure from a codec this browser cannot decode (e.g. WebM/Opus in Safari).
+      const media = ws.getMediaElement()?.error;
+      const cause = err instanceof Error
+        ? `${err.name}: ${err.message}`
+        : media ? `MediaError ${media.code}${media.message ? `: ${media.message}` : ''}` : String(err);
+      setError(`Failed to load audio. Please check the URL or file format. (${cause})`);
       setIsLoading(false);
     });
 
