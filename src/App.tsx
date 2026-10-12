@@ -175,8 +175,38 @@ interface PortfolioRecording {
   tags?: string[];
   transcriptionExcerpt?: string;
   transcriptionText?: string;
+  /** Set by the worker's fields=light listing, which omits transcriptionText itself. */
+  hasTranscript?: boolean;
   publicationState?: string;
 }
+
+/**
+ * Resolves the URL that actually serves a portfolio recording's bytes.
+ *
+ * R2 keys are stored ALREADY percent-encoded: a file uploaded as "Method Creation.m4a" lands
+ * under the key "…-Method%20Creation.m4a", where %20 is three literal characters. The stored
+ * r2Url embeds that key verbatim, so audio.vegvisr.org decodes the path once and then looks
+ * for a key containing a real space — which does not exist, hence 404 and a dead player for
+ * every recording whose original filename had a space or a non-ASCII character. Re-encoding
+ * each path segment escapes the literal '%' to '%25' (…%2520Creation.m4a), which decodes back
+ * to the real key. Keys with nothing encoded pass through untouched.
+ *
+ * This mirrors recordingAudioUrl() in vegvisr-frontend's AudioPortfolio.vue — which is why
+ * that portfolio plays files this one could not.
+ */
+const recordingAudioUrl = (
+  rec: Pick<PortfolioRecording, 'audioUrl' | 'r2Url' | 'r2Key'>
+): string | null => {
+  if (rec.r2Key) {
+    let origin = 'https://audio.vegvisr.org';
+    if (rec.r2Url) {
+      try { origin = new URL(rec.r2Url).origin; } catch { /* keep the default origin */ }
+    }
+    const encodedKey = rec.r2Key.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+    return `${origin}/${encodedKey}`;
+  }
+  return rec.audioUrl || rec.r2Url || null;
+};
 
 /* ── Portfolio Tab: full-width table with CRUD ── */
 type SortKey = 'name' | 'date' | 'duration';
@@ -207,25 +237,174 @@ const PortfolioBrowser = ({ email, onSelect }: {
   const [viewingTranscript, setViewingTranscript] = useState<PortfolioRecording | null>(null);
   const [transcriptCopied, setTranscriptCopied] = useState(false);
 
+  // Recordings saved before the upload path measured duration carry duration: 0, so the table
+  // showed "--:--" for nearly every row. The file itself always knows: point an <audio> at it
+  // with preload="metadata" and the browser reads just the container header. Measured values
+  // are written back to KV so each recording is probed at most once, ever.
+  const probedRef = useRef<Set<string>>(new Set());
+  const probeCancelledRef = useRef(false);
+  useEffect(() => () => { probeCancelledRef.current = true; }, []);
+
+  const measureDuration = (url: string) =>
+    new Promise<number>((resolve) => {
+      const el = new Audio();
+      let settled = false;
+      const finish = (value: number) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        el.removeAttribute('src');
+        el.load();
+        resolve(value);
+      };
+      // A single unreachable or slow file must not stall the queue behind it.
+      const timer = setTimeout(() => finish(0), 30000);
+      el.preload = 'metadata';
+      el.onloadedmetadata = () => finish(Number.isFinite(el.duration) ? el.duration : 0);
+      el.onerror = () => finish(0);
+      el.src = url;
+    });
+
+  const backfillDurations = useCallback(async (list: PortfolioRecording[]) => {
+    const queue = list.filter((r) => {
+      const key = r.recordingId || r.id;
+      if (r.duration || probedRef.current.has(key)) return false;
+      probedRef.current.add(key);
+      return true;
+    });
+    if (queue.length === 0) return;
+
+    const worker = async () => {
+      for (;;) {
+        const rec = queue.shift();
+        if (!rec || probeCancelledRef.current) return;
+        const url = recordingAudioUrl(rec);
+        if (!url) continue;
+        const seconds = await measureDuration(url);
+        if (probeCancelledRef.current || !seconds) continue;
+        const recordingId = rec.recordingId || rec.id;
+        setRecordings((prev) => prev.map((r) =>
+          (r.recordingId || r.id) === recordingId ? { ...r, duration: seconds } : r
+        ));
+        // Best-effort persistence — the displayed value is already correct either way.
+        fetch(
+          `${PORTFOLIO_API}/update-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ duration: Math.floor(seconds) }),
+          }
+        ).catch(() => { /* leave the DB stale; the next visit re-measures */ });
+      }
+    };
+
+    // Four at a time: enough to clear a long list quickly without saturating the connection
+    // pool that the rest of the app (waveform loads, edits) shares.
+    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
+  }, [email]);
+
+  // A refresh while the tail of a previous load is still streaming must not interleave rows.
+  const fetchRunRef = useRef(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [totalCount, setTotalCount] = useState(0);
+
   const fetchRecordings = useCallback(async () => {
+    const run = ++fetchRunRef.current;
     try {
       setLoading(true);
       setError(null);
       // Role is resolved server-side from vegvisr_org.config by userEmail — the worker
       // no longer trusts a client-supplied role (see audio-portfolio-worker/index.js fix:
       // hardcoding Superadmin here used to leak every user's recordings to every caller).
-      const res = await fetch(`${PORTFOLIO_API}/list-recordings?userEmail=${encodeURIComponent(email)}&limit=200`);
-      if (!res.ok) throw new Error('Failed to fetch recordings');
-      const data = await res.json();
-      setRecordings(data.recordings || []);
+      //
+      // order=newest is the worker's paged newest-first listing for one owner; without it the
+      // worker returns the OLDEST `limit` records after reading every KV value in sequence,
+      // which froze this list at 3 Aug 2026 and took several seconds. fields=light drops the
+      // transcript blobs (~4 MB for 263 recordings); the transcript viewer fetches its one
+      // record from /get-recording instead.
+      //
+      // The newest FIRST_PAGE rows are what is wanted nearly every visit, so they render on
+      // their own (~0.5 s) and the remainder streams in behind them — search, the category
+      // list and the filters then cover the whole portfolio without holding up first paint.
+      const FIRST_PAGE = 5;
+      const REST_PAGE = 500;
+      const loadPage = async (offset: number, limit: number) => {
+        const params = new URLSearchParams({
+          userEmail: email, order: 'newest', fields: 'light',
+          offset: String(offset), limit: String(limit),
+        });
+        const res = await fetch(`${PORTFOLIO_API}/list-recordings?${params.toString()}`);
+        if (!res.ok) throw new Error('Failed to fetch recordings');
+        return await res.json() as {
+          recordings?: PortfolioRecording[]; total?: number; nextOffset?: number; hasMore?: boolean;
+        };
+      };
+
+      const first = await loadPage(0, FIRST_PAGE);
+      if (run !== fetchRunRef.current) return;
+      const firstList = first.recordings || [];
+      setRecordings(firstList);
+      setTotalCount(first.total ?? firstList.length);
+      setLoading(false);
+      void backfillDurations(firstList); // runs in the background; the list renders immediately
+
+      let offset = first.nextOffset ?? firstList.length;
+      let hasMore = Boolean(first.hasMore);
+      setLoadingMore(hasMore);
+      while (hasMore) {
+        const page = await loadPage(offset, REST_PAGE);
+        if (run !== fetchRunRef.current) return;
+        const more = page.recordings || [];
+        setRecordings((prev) => {
+          const seen = new Set(prev.map((r) => r.recordingId || r.id));
+          return [...prev, ...more.filter((r) => !seen.has(r.recordingId || r.id))];
+        });
+        void backfillDurations(more);
+        hasMore = Boolean(page.hasMore) && more.length > 0;
+        offset = page.nextOffset ?? offset + more.length;
+      }
     } catch (err) {
+      if (run !== fetchRunRef.current) return;
       setError(err instanceof Error ? err.message : 'Failed to load portfolio');
     } finally {
-      setLoading(false);
+      if (run === fetchRunRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
-  }, [email]);
+  }, [email, backfillDurations]);
 
   useEffect(() => { fetchRecordings(); }, [fetchRecordings]);
+
+  // The list carries no transcript text, so the viewer opens at once on the row and fills in
+  // from /get-recording; the text is kept on the row so reopening it costs nothing.
+  const openTranscript = async (rec: PortfolioRecording) => {
+    if (!(rec.hasTranscript || rec.transcriptionText)) return;
+    setTranscriptCopied(false);
+    setViewingTranscript(rec);
+    if (rec.transcriptionText) return;
+    const recordingId = rec.recordingId || rec.id;
+    try {
+      const res = await fetch(
+        `${PORTFOLIO_API}/get-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`
+      );
+      if (!res.ok) throw new Error('Failed to load transcript');
+      const data = await res.json();
+      const text: string = data.recording?.transcriptionText || '';
+      setRecordings((prev) => prev.map((r) =>
+        (r.recordingId || r.id) === recordingId ? { ...r, transcriptionText: text } : r
+      ));
+      setViewingTranscript((cur) =>
+        cur && (cur.recordingId || cur.id) === recordingId ? { ...cur, transcriptionText: text } : cur
+      );
+    } catch {
+      setViewingTranscript((cur) =>
+        cur && (cur.recordingId || cur.id) === recordingId
+          ? { ...cur, transcriptionText: 'Could not load the transcript. Close and try again.' }
+          : cur
+      );
+    }
+  };
 
   // Transcribes (Whisper, cached on repeat calls) and generates a summary/keywords/category
   // via Claude Haiku, then patches the recording in place so the list reflects it immediately.
@@ -249,7 +428,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
       if (!res.ok || !data.success) throw new Error(data.error || `Failed with status ${res.status}`);
       setRecordings((prev) => prev.map((r) =>
         (r.recordingId || r.id) === recordingId
-          ? { ...r, category: data.category, tags: data.keywords, transcriptionExcerpt: data.summary }
+          ? { ...r, category: data.category, tags: data.keywords, transcriptionExcerpt: data.summary, hasTranscript: true }
           : r
       ));
     } catch (err) {
@@ -406,7 +585,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
         {!loading && !error && filtered.length === 0 && (
           <div className="text-center py-14 text-zinc-400 text-sm">
             <FolderOpen size={28} className="mx-auto mb-2 text-zinc-300" />
-            {recordings.length === 0 ? 'No recordings in your portfolio yet — upload your first file.' : 'No recordings match your filters.'}
+            {recordings.length === 0 ? 'No recordings in your portfolio yet — upload your first file.' : loadingMore ? 'No match yet — still loading older recordings…' : 'No recordings match your filters.'}
           </div>
         )}
 
@@ -485,9 +664,9 @@ const PortfolioBrowser = ({ email, onSelect }: {
                           {isSummarizing ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
                         </button>
                         <button
-                          onClick={(e) => { e.stopPropagation(); if (rec.transcriptionText) { setTranscriptCopied(false); setViewingTranscript(rec); } }}
-                          disabled={!rec.transcriptionText}
-                          title={rec.transcriptionText ? 'View full transcript' : 'No transcript yet — generate a summary first'}
+                          onClick={(e) => { e.stopPropagation(); void openTranscript(rec); }}
+                          disabled={!(rec.hasTranscript || rec.transcriptionText)}
+                          title={(rec.hasTranscript || rec.transcriptionText) ? 'View full transcript' : 'No transcript yet — generate a summary first'}
                           className="p-1.5 text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:opacity-25 disabled:hover:bg-transparent disabled:hover:text-zinc-400"
                         >
                           <FileText size={14} />
@@ -499,9 +678,9 @@ const PortfolioBrowser = ({ email, onSelect }: {
                         >
                           <Pencil size={14} />
                         </button>
-                        {rec.r2Url && (
+                        {recordingAudioUrl(rec) && (
                           <a
-                            href={rec.r2Url}
+                            href={recordingAudioUrl(rec)!}
                             download
                             onClick={(e) => e.stopPropagation()}
                             title="Download"
@@ -524,6 +703,13 @@ const PortfolioBrowser = ({ email, onSelect }: {
               })}
             </div>
           </>
+        )}
+
+        {loadingMore && !loading && !error && (
+          <div className="flex items-center justify-center py-3 border-t border-zinc-100 text-xs text-zinc-400">
+            <Loader2 size={12} className="animate-spin mr-2" />
+            Loading older recordings… {recordings.length} of {totalCount}
+          </div>
         )}
       </div>
 
@@ -636,7 +822,13 @@ const PortfolioBrowser = ({ email, onSelect }: {
                 </button>
               </div>
               <div className="px-6 py-4 overflow-y-auto flex-1">
-                <p className="text-sm text-zinc-700 whitespace-pre-wrap leading-relaxed">{viewingTranscript.transcriptionText}</p>
+                {viewingTranscript.transcriptionText ? (
+                  <p className="text-sm text-zinc-700 whitespace-pre-wrap leading-relaxed">{viewingTranscript.transcriptionText}</p>
+                ) : (
+                  <div className="flex items-center text-sm text-zinc-400">
+                    <Loader2 size={14} className="animate-spin mr-2" /> Loading transcript…
+                  </div>
+                )}
               </div>
               <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-100 flex-shrink-0">
                 <button
@@ -1122,7 +1314,7 @@ export default function App() {
   };
 
   const handlePortfolioSelect = (rec: PortfolioRecording) => {
-    const url = rec.audioUrl || rec.r2Url || (rec.r2Key ? `https://audio.vegvisr.org/${rec.r2Key}` : null);
+    const url = recordingAudioUrl(rec);
     if (url) {
       setAudioUrl(url);
       setLoadedRecordingId(rec.recordingId || rec.id);
