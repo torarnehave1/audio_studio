@@ -308,7 +308,12 @@ const PortfolioBrowser = ({ email, onSelect }: {
         if (!rec || probeCancelledRef.current) return;
         const url = recordingAudioUrl(rec);
         if (!url) continue;
-        const seconds = await measureDuration(url);
+        // The probe reads cross-origin (see measureDuration), and a <audio> cannot be told to
+        // skip the HTTP cache. A file an earlier no-CORS load already cached without CORS
+        // headers would be refused from cache for up to 4 h, logging one console error per
+        // recording. The query string gives the probe its own cache key; the host ignores it.
+        const probeUrl = /^https?:/i.test(url) ? `${url}${url.includes('?') ? '&' : '?'}probe=1` : url;
+        const seconds = await measureDuration(probeUrl);
         if (probeCancelledRef.current || !seconds) continue;
         const recordingId = rec.recordingId || rec.id;
         setRecordings((prev) => prev.map((r) =>
