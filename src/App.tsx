@@ -2579,7 +2579,7 @@ export default function App() {
                       title="Save the whole clip to your Vegvisr audio portfolio"
                     >
                       {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                      {isSaving ? 'Saving...' : activeRegion ? 'Save Whole Clip' : 'Save to Portfolio'}
+                      {isSaving ? 'Saving...' : 'Save Whole Clip'}
                     </button>
                   )}
                 </div>
