@@ -38,6 +38,7 @@ import {
   Layers,
   Pencil,
   FileText,
+  Globe,
   Copy
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -178,6 +179,8 @@ interface PortfolioRecording {
   /** Set by the worker's fields=light listing, which omits transcriptionText itself. */
   hasTranscript?: boolean;
   publicationState?: string;
+  /** Owner of the recording — a Superadmin listing can include other users' recordings. */
+  userEmail?: string;
 }
 
 /**
@@ -252,8 +255,10 @@ const formatClock = (sec: number, decimals = 0): string => {
 type SortKey = 'name' | 'date' | 'duration';
 type SummaryStage = 'transcribing' | 'summarizing' | null;
 
-const PortfolioBrowser = ({ email, token, onSelect }: {
+const PortfolioBrowser = ({ email, token, isSuperadmin, onSelect }: {
   email: string;
+  /** audio-portfolio-worker's /update-publication-state is Superadmin-only; others get no publish controls. */
+  isSuperadmin: boolean;
   // emailVerificationToken — audio-portfolio-worker requires it as X-API-Token on every
   // per-user route (list/get/update/delete/generate-summary) since 2026-11-14.
   token: string;
@@ -279,6 +284,9 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [viewingTranscript, setViewingTranscript] = useState<PortfolioRecording | null>(null);
   const [transcriptCopied, setTranscriptCopied] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
 
   // Recordings saved before the upload path measured duration carry duration: 0, so the table
   // showed "--:--" for nearly every row. The file itself always knows: point an <audio> at it
@@ -555,6 +563,49 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
     }
   };
 
+  const toggleSelected = (recordingId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(recordingId)) next.delete(recordingId); else next.add(recordingId);
+      return next;
+    });
+  };
+
+  /** Sets draft/published on each recording, one request per recording; reports any that failed. */
+  const setPublicationState = async (ids: string[], state: 'draft' | 'published') => {
+    if (ids.length === 0) return;
+    setPublishBusy(true);
+    setPublishError(null);
+    const failures: string[] = [];
+    let index = 0;
+    const worker = async () => {
+      while (index < ids.length) {
+        const recordingId = ids[index++];
+        const rec = recordings.find((r) => (r.recordingId || r.id) === recordingId);
+        try {
+          const res = await fetch(`${PORTFOLIO_API}/update-publication-state`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Token': token },
+            body: JSON.stringify({ userEmail: rec?.userEmail || email, recordingId, publicationState: state }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data.success === false) throw new Error(data.error || `status ${res.status}`);
+          setRecordings((prev) => prev.map((r) =>
+            (r.recordingId || r.id) === recordingId ? { ...r, publicationState: state } : r
+          ));
+          setSelectedIds((prev) => { const next = new Set(prev); next.delete(recordingId); return next; });
+        } catch (err) {
+          failures.push(`${rec?.displayName || recordingId}: ${err instanceof Error ? err.message : 'failed'}`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker));
+    if (failures.length) {
+      setPublishError(`Could not change ${failures.length} of ${ids.length}: ${failures.join('; ')}`);
+    }
+    setPublishBusy(false);
+  };
+
   const categories = Array.from(new Set(recordings.map((r) => r.category).filter(Boolean))).sort();
 
   const filtered = recordings
@@ -624,6 +675,47 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
         </select>
       </div>
 
+      {isSuperadmin && (selectedIds.size > 0 || publishError) && (
+        <div className="flex flex-wrap items-center gap-2 mb-3 px-4 py-2.5 bg-indigo-50 border border-indigo-100 rounded-xl text-sm">
+          {selectedIds.size > 0 && (
+            <>
+              <span className="font-medium text-indigo-700">{selectedIds.size} selected</span>
+              <button
+                type="button"
+                disabled={publishBusy}
+                onClick={() => setPublicationState([...selectedIds], 'published')}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 text-xs font-medium disabled:opacity-50"
+              >
+                {publishBusy ? <Loader2 size={13} className="animate-spin" /> : <Globe size={13} />}
+                Publish
+              </button>
+              <button
+                type="button"
+                disabled={publishBusy}
+                onClick={() => setPublicationState([...selectedIds], 'draft')}
+                className="px-3 py-1.5 bg-white border border-zinc-200 text-zinc-600 rounded-lg hover:bg-zinc-50 text-xs font-medium disabled:opacity-50"
+              >
+                Set to draft
+              </button>
+              <button
+                type="button"
+                disabled={publishBusy}
+                onClick={() => setSelectedIds(new Set())}
+                className="px-2 py-1.5 text-zinc-500 hover:text-zinc-700 text-xs"
+              >
+                Clear selection
+              </button>
+            </>
+          )}
+          {publishError && (
+            <p className="w-full text-xs text-red-600">
+              {publishError}
+              <button type="button" onClick={() => setPublishError(null)} className="ml-2 underline">Dismiss</button>
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="bg-white border border-zinc-200 rounded-2xl shadow-sm overflow-hidden">
         {loading && (
           <div className="flex items-center justify-center py-14">
@@ -645,8 +737,19 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
 
         {!loading && !error && filtered.length > 0 && (
           <>
-            <div className="hidden sm:grid grid-cols-[1fr_120px_90px_110px_150px] gap-3 px-4 py-2.5 bg-zinc-50 border-b border-zinc-200">
-              <SortHeader label="Title" sortKeyName="name" />
+            <div className="hidden sm:grid grid-cols-[1fr_140px_90px_110px_150px] gap-3 px-4 py-2.5 bg-zinc-50 border-b border-zinc-200">
+              <div className="flex items-center gap-3">
+                {isSuperadmin && (
+                  <input
+                    type="checkbox"
+                    aria-label="Select all shown recordings"
+                    className="w-4 h-4 accent-indigo-600 cursor-pointer"
+                    checked={filtered.length > 0 && filtered.every((r) => selectedIds.has(r.recordingId || r.id))}
+                    onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((r) => r.recordingId || r.id)) : new Set())}
+                  />
+                )}
+                <SortHeader label="Title" sortKeyName="name" />
+              </div>
               <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400">Category</span>
               <SortHeader label="Duration" sortKeyName="duration" />
               <SortHeader label="Date" sortKeyName="date" />
@@ -658,25 +761,53 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
                 const isSummarizing = summarizingId === recordingId;
                 return (
                   <div key={recordingId} className="hover:bg-zinc-50 transition-colors">
-                    <div className="grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_120px_90px_110px_150px] gap-3 items-start px-4 py-3">
+                    <div className="grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_140px_90px_110px_150px] gap-3 items-start px-4 py-3">
                       <div className="flex items-start gap-3 min-w-0">
+                        {isSuperadmin && (
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${rec.displayName || recordingId}`}
+                            className="w-4 h-4 mt-2 accent-indigo-600 cursor-pointer flex-shrink-0"
+                            checked={selectedIds.has(recordingId)}
+                            onChange={() => toggleSelected(recordingId)}
+                          />
+                        )}
                         <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-500 flex-shrink-0 mt-0.5">
                           <Music size={14} />
                         </div>
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-start gap-2">
                             <button
                               onClick={() => onSelect(rec)}
-                              className="text-sm font-medium text-zinc-800 hover:text-indigo-600 hover:underline truncate max-w-[240px] text-left"
+                              className="text-sm font-medium text-zinc-800 hover:text-indigo-600 hover:underline text-left break-words min-w-0"
                               title="Load in editor"
                             >
                               {rec.displayName || rec.id}
                             </button>
-                            <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full flex-shrink-0 ${
-                              rec.publicationState === 'published' ? 'bg-emerald-50 text-emerald-600' : 'bg-zinc-100 text-zinc-500'
-                            }`}>
-                              {rec.publicationState || 'draft'}
-                            </span>
+                            {isSuperadmin ? (
+                              <button
+                                type="button"
+                                disabled={publishBusy}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void setPublicationState([recordingId], rec.publicationState === 'published' ? 'draft' : 'published');
+                                }}
+                                title={rec.publicationState === 'published' ? 'Published: click to set back to draft' : 'Draft: click to publish'}
+                                className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 mt-0.5 rounded-full flex-shrink-0 transition-colors disabled:opacity-50 ${
+                                  rec.publicationState === 'published'
+                                    ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100'
+                                    : 'bg-zinc-100 text-zinc-500 hover:bg-indigo-100 hover:text-indigo-600'
+                                }`}
+                              >
+                                {rec.publicationState || 'draft'}
+                              </button>
+                            ) : (
+                              <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 mt-0.5 rounded-full flex-shrink-0 ${
+                                rec.publicationState === 'published' ? 'bg-emerald-50 text-emerald-600' : 'bg-zinc-100 text-zinc-500'
+                              }`}>
+                                {rec.publicationState || 'draft'}
+                              </span>
+                            )}
                           </div>
                           {isSummarizing ? (
                             <p className="text-xs text-purple-600 flex items-center gap-1.5 mt-0.5">
@@ -686,7 +817,7 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
                                 : 'Generating summary…'}
                             </p>
                           ) : rec.transcriptionExcerpt ? (
-                            <p className="text-xs text-zinc-500 italic mt-0.5 line-clamp-2" title={rec.transcriptionExcerpt}>
+                            <p className="text-xs text-zinc-500 italic mt-1 leading-relaxed whitespace-pre-line">
                               {rec.transcriptionExcerpt}
                               {rec.tags && rec.tags.length > 0 && (
                                 <span className="ml-1 not-italic text-zinc-400">— {rec.tags.join(', ')}</span>
@@ -702,7 +833,7 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
                         </div>
                       </div>
                       <div className="hidden sm:block pt-0.5">
-                        <span className="text-xs font-medium px-2 py-1 rounded-md bg-zinc-100 text-zinc-500 whitespace-nowrap">
+                        <span className="inline-block text-xs font-medium px-2 py-1 rounded-md bg-zinc-100 text-zinc-500">
                           {rec.category || 'Uncategorized'}
                         </span>
                       </div>
@@ -2169,7 +2300,7 @@ export default function App() {
       {/* System Owner "Login as…" control + impersonation banner */}
       <ImpersonationBar />
       <DeployBadge />
-      <div className="max-w-5xl mx-auto p-4 md:p-8">
+      <div className={`${activeTab === 'portfolio' ? 'max-w-7xl' : 'max-w-5xl'} mx-auto p-4 md:p-8`}>
         {/* Header */}
         <header className="mb-8 flex items-center justify-between flex-wrap gap-4">
           <div className="flex items-center gap-4">
@@ -2391,7 +2522,7 @@ export default function App() {
 
         <main className="grid gap-6">
         {activeTab === 'portfolio' && authUser ? (
-          <PortfolioBrowser email={authUser.email} token={authUser.emailVerificationToken || ''} onSelect={handlePortfolioSelect} />
+          <PortfolioBrowser email={authUser.email} token={authUser.emailVerificationToken || ''} isSuperadmin={(authUser.role || '').toLowerCase() === 'superadmin'} onSelect={handlePortfolioSelect} />
         ) : (
           <>
           {/* Input Section */}
