@@ -232,6 +232,23 @@ const fetchAudio = async (url: string): Promise<Response> => {
 };
 
 /* ── Portfolio Tab: full-width table with CRUD ── */
+/**
+ * Formats seconds as m:ss, or h:mm:ss once the audio passes an hour (87:40 → 1:27:40).
+ * `decimals` keeps fractional seconds for the region inputs and save dialog.
+ */
+const formatClock = (sec: number, decimals = 0): string => {
+  // Round once up front so 59.996s becomes 1:00.00, never 0:60.00.
+  const factor = 10 ** decimals;
+  const total = decimals > 0 ? Math.round(Math.max(0, sec || 0) * factor) / factor : Math.floor(Math.max(0, sec || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const rawS = total % 60;
+  const sStr = decimals > 0
+    ? rawS.toFixed(decimals).padStart(3 + decimals, '0')
+    : Math.floor(rawS).toString().padStart(2, '0');
+  return h > 0 ? `${h}:${m.toString().padStart(2, '0')}:${sStr}` : `${m}:${sStr}`;
+};
+
 type SortKey = 'name' | 'date' | 'duration';
 type SummaryStage = 'transcribing' | 'summarizing' | null;
 
@@ -562,9 +579,7 @@ const PortfolioBrowser = ({ email, token, onSelect }: {
 
   const formatDuration = (sec: number) => {
     if (!sec) return '--:--';
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    return `${m}:${s.toString().padStart(2, '0')}`;
+    return formatClock(sec);
   };
 
   const SortHeader = ({ label, sortKeyName }: { label: string; sortKeyName: SortKey }) => (
@@ -911,11 +926,7 @@ const VoiceRecorder = ({ onRecordingComplete, hasAudio, onAppendRecording }: {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const formatRecTime = (sec: number) => {
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  };
+  const formatRecTime = (sec: number) => formatClock(sec);
 
   const startTimer = () => {
     timerRef.current = setInterval(() => {
@@ -1125,11 +1136,7 @@ const TimeInput = ({ value, onChange, label, max }: { value: number, onChange: (
   const [localValue, setLocalValue] = useState("");
   const [isFocused, setIsFocused] = useState(false);
 
-  const format = (val: number) => {
-    const m = Math.floor(val / 60);
-    const s = (val % 60).toFixed(2);
-    return `${m}:${s.padStart(5, '0')}`;
-  };
+  const format = (val: number) => formatClock(val, 2);
 
   useEffect(() => {
     if (!isFocused) {
@@ -1152,7 +1159,7 @@ const TimeInput = ({ value, onChange, label, max }: { value: number, onChange: (
           setLocalValue(e.target.value);
           onChange(e.target.value);
         }}
-        className="text-sm font-mono font-bold text-indigo-700 bg-transparent border-none focus:ring-0 w-24 p-0"
+        className="text-sm font-mono font-bold text-indigo-700 bg-transparent border-none focus:ring-0 w-28 p-0"
         placeholder="0:00.00"
       />
     </div>
@@ -1191,14 +1198,14 @@ const ClippingControls = React.memo(({
     <div className="flex items-center gap-2">
       <div className="bg-indigo-50 border border-indigo-100 px-3 py-2 rounded-lg flex items-center gap-4 mr-2">
         <TimeInput 
-          label="Start (m:ss)"
+          label="Start"
           value={activeRegion.start}
           max={activeRegion.end - 0.01}
           onChange={(val) => onManualChange('start', val)}
         />
         <div className="w-px h-6 bg-indigo-200" />
         <TimeInput 
-          label="End (m:ss)"
+          label="End"
           value={activeRegion.end}
           max={duration}
           onChange={(val) => onManualChange('end', val)}
@@ -1278,6 +1285,7 @@ export default function App() {
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
   const [loginError, setLoginError] = useState('');
+  const loginInputRef = useRef<HTMLInputElement>(null);
 
   // Top-level tab: Editor (waveform + upload) or Portfolio (own full-width view)
   const [activeTab, setActiveTab] = useState<'editor' | 'portfolio'>('editor');
@@ -1335,6 +1343,33 @@ export default function App() {
     }
   }, []);
 
+  // The magic link opens in a new tab and stores the user in localStorage there; pick that up
+  // here so this tab becomes logged in without a reload — the audio loaded in it stays loaded.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== 'user') return;
+      const stored = readStoredUser();
+      if (stored) {
+        setAuthUser(stored);
+        setAuthStatus('authed');
+        setLoginMessage('');
+        setLoginError('');
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  /** Saving needs an account. Logged out: say so and put the cursor in the email field. */
+  const requireLogin = (): boolean => {
+    if (authStatus === 'authed' && authUser) return true;
+    setLoginError('');
+    setLoginMessage('Log in to save to your portfolio: enter your email above and click Login. Open the link from the email, then come back to this tab. Your audio stays loaded.');
+    loginInputRef.current?.focus();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    return false;
+  };
+
   const handleSendMagicLink = async () => {
     if (!loginEmail.trim()) return;
     setLoginError('');
@@ -1342,7 +1377,7 @@ export default function App() {
     setLoginLoading(true);
     try {
       await sendMagicLink(loginEmail);
-      setLoginMessage('Magic link sent! Check your email.');
+      setLoginMessage('Magic link sent. Check your email, open the link, then come back to this tab.');
     } catch (err) {
       setLoginError(err instanceof Error ? err.message : 'Failed to send magic link.');
     } finally {
@@ -1464,6 +1499,7 @@ export default function App() {
   };
 
   const openSaveDialog = (scope: 'region' | 'full') => {
+    if (!requireLogin()) return;
     applySaveScope(scope);
     setShowSaveDialog(true);
   };
@@ -1767,7 +1803,9 @@ export default function App() {
     
     // Parse mm:ss or mm.ss or ss.ss
     const parts = value.split(/[:]/);
-    if (parts.length === 2) {
+    if (parts.length === 3) {
+      numValue = (parseInt(parts[0]) || 0) * 3600 + (parseInt(parts[1]) || 0) * 60 + (parseFloat(parts[2]) || 0);
+    } else if (parts.length === 2) {
       numValue = (parseInt(parts[0]) || 0) * 60 + (parseFloat(parts[1]) || 0);
     } else {
       // Handle mm.ss if user uses dot as minute separator
@@ -1809,11 +1847,7 @@ export default function App() {
     setActiveRegion(null);
   };
 
-  const formatTime = (time: number) => {
-    const minutes = Math.floor(time / 60);
-    const seconds = Math.floor(time % 60);
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-  };
+  const formatTime = (time: number) => formatClock(time);
 
   const playRegion = () => {
     if (currentRegionRef.current) {
@@ -2199,6 +2233,7 @@ export default function App() {
             {authStatus === 'anonymous' && (
               <div className="flex items-center gap-2">
                 <input
+                  ref={loginInputRef}
                   type="email"
                   placeholder="email@example.com"
                   value={loginEmail}
@@ -2307,11 +2342,11 @@ export default function App() {
                     </p>
                   ) : activeRegion && saveScope === 'region' ? (
                     <p className="text-xs text-zinc-400">
-                      Region: {Math.floor(activeRegion.start / 60)}:{(activeRegion.start % 60).toFixed(1).padStart(4, '0')} &ndash; {Math.floor(activeRegion.end / 60)}:{(activeRegion.end % 60).toFixed(1).padStart(4, '0')} ({(activeRegion.end - activeRegion.start).toFixed(1)}s)
+                      Region: {formatClock(activeRegion.start, 1)} &ndash; {formatClock(activeRegion.end, 1)} ({formatClock(activeRegion.end - activeRegion.start, 1)})
                     </p>
                   ) : (
                     <p className="text-xs text-zinc-400">
-                      Whole clip &mdash; {Math.floor(duration / 60)}:{(duration % 60).toFixed(1).padStart(4, '0')} ({duration.toFixed(1)}s)
+                      Whole clip &mdash; {formatClock(duration, 1)}
                       {canSaveOriginalFile
                         ? <> &middot; original file uploaded as-is ({(sourceFile!.file.size / (1024 * 1024)).toFixed(1)} MB, no re-encoding)</>
                         : <> &middot; saved as WAV{track2Url ? ' (mixed with overlay track)' : ''}</>}
@@ -2395,6 +2430,17 @@ export default function App() {
                   </div>
                   <input type="file" className="hidden" accept="audio/*" onChange={handleFileUpload} />
                 </label>
+                {!authUser && authStatus === 'anonymous' && (
+                  <button
+                    type="button"
+                    onClick={requireLogin}
+                    className="mt-2 flex items-center justify-center gap-2 w-full h-9 px-4 bg-amber-50 border-2 border-dashed border-amber-200 rounded-lg hover:border-amber-400 hover:bg-amber-100/50 transition-all text-amber-600 hover:text-amber-700"
+                    title="Log in to upload straight to your portfolio"
+                  >
+                    <Zap size={16} />
+                    <span className="text-xs font-medium">Quick upload to portfolio (no editing)</span>
+                  </button>
+                )}
                 {authUser && (
                   <label
                     className="mt-2 flex items-center justify-center w-full h-9 px-4 bg-amber-50 border-2 border-dashed border-amber-200 rounded-lg cursor-pointer hover:border-amber-400 hover:bg-amber-100/50 transition-all group"
@@ -2564,7 +2610,7 @@ export default function App() {
                     isSaving={isSaving}
                     isCutting={isCutting}
                     isPlaying={isPlaying}
-                    isLoggedIn={authStatus === 'authed'}
+                    isLoggedIn={authStatus !== 'checking'}
                     onPlayRegion={playRegion}
                     onManualChange={handleRegionManualChange}
                     onDownload={downloadClip}
@@ -2574,7 +2620,7 @@ export default function App() {
                     onAdd={addRegion}
                   />
                   {/* Save the whole clip to portfolio — available with or without a region selected */}
-                  {authStatus === 'authed' && (
+                  {authStatus !== 'checking' && (
                     <button
                       type="button"
                       onClick={() => openSaveDialog('full')}
