@@ -2159,7 +2159,7 @@ export default function App() {
         };
         const metaRes = await fetch(`${PORTFOLIO_API}/save-recording`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-User-Email': authUser.email },
+          headers: { 'Content-Type': 'application/json', 'X-User-Email': authUser.email, 'X-API-Token': authUser.emailVerificationToken || '' },
           body: JSON.stringify(recordingData),
         });
         if (!metaRes.ok) throw new Error(`Save failed: ${metaRes.status}`);
@@ -2277,6 +2277,7 @@ export default function App() {
         headers: {
           'Content-Type': 'application/json',
           'X-User-Email': authUser.email,
+          'X-API-Token': authUser.emailVerificationToken || '',
         },
         body: JSON.stringify(recordingData),
       });
