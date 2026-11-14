@@ -1227,10 +1227,10 @@ const ClippingControls = React.memo(({
           onClick={onSaveToPortfolio}
           disabled={isSaving}
           className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          title="Save clip to your Vegvisr audio portfolio"
+          title="Save the selected region to your Vegvisr audio portfolio"
         >
           {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-          {isSaving ? 'Saving...' : 'Save to Portfolio'}
+          {isSaving ? 'Saving...' : 'Save Region'}
         </button>
       )}
       <button
@@ -1287,6 +1287,11 @@ export default function App() {
   const [clipName, setClipName] = useState('');
   const [clipCategory, setClipCategory] = useState('clip');
   const [directUploadFile, setDirectUploadFile] = useState<File | null>(null);
+  // What the save dialog saves: the selected region, or the whole clip in the editor.
+  const [saveScope, setSaveScope] = useState<'region' | 'full'>('full');
+  // The local file behind the editor's current audio, kept so "Save whole clip" can upload
+  // the original bytes as-is instead of decoding + re-encoding the entire file to WAV.
+  const [sourceFile, setSourceFile] = useState<{ file: File; url: string } | null>(null);
 
   // Track 2 (overlay) state
   const waveformRef2 = useRef<HTMLDivElement>(null);
@@ -1442,15 +1447,24 @@ export default function App() {
     }
   };
 
-  const openSaveDialog = () => {
-    const isClip = !!activeRegion;
+  const applySaveScope = (scope: 'region' | 'full') => {
+    const isClip = scope === 'region' && !!activeRegion;
+    setSaveScope(isClip ? 'region' : 'full');
     const defaultName = isClip
-      ? (loadedRecordingName ? `Clip of ${loadedRecordingName}` : `Clip ${Math.floor(activeRegion.start)}s-${Math.floor(activeRegion.end)}s`)
+      ? (loadedRecordingName ? `Clip of ${loadedRecordingName}` : `Clip ${Math.floor(activeRegion!.start)}s-${Math.floor(activeRegion!.end)}s`)
       : (loadedRecordingName || 'Untitled Recording');
     setClipName(defaultName);
     setClipCategory(isClip ? 'clip' : 'recording');
+  };
+
+  const openSaveDialog = (scope: 'region' | 'full') => {
+    applySaveScope(scope);
     setShowSaveDialog(true);
   };
+
+  // Whole clip of an untouched local upload (no cut, no append, no overlay track): the original
+  // file is exactly what is on screen, so it can be uploaded without re-encoding.
+  const canSaveOriginalFile = !!sourceFile && sourceFile.url === audioUrl && !track2Url;
 
   const initWaveSurfer = useCallback((url: string) => {
     if (!waveformRef.current) return;
@@ -1609,8 +1623,12 @@ export default function App() {
     if (file) {
       const url = URL.createObjectURL(file);
       setAudioUrl(url);
+      setSourceFile({ file, url });
+      setLoadedRecordingId(null);
+      setLoadedRecordingName(file.name.replace(/\.[^.]+$/, ''));
       initWaveSurfer(url);
     }
+    e.target.value = '';
   };
 
   const handleTrack2FileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1939,13 +1957,15 @@ export default function App() {
   };
 
   const saveClipToPortfolio = async () => {
-    if (directUploadFile) {
+    const useRegion = !!activeRegion && saveScope === 'region';
+    const originalFile = directUploadFile ?? (!useRegion && canSaveOriginalFile ? sourceFile!.file : null);
+    if (originalFile) {
       if (!authUser) return;
       try {
         setIsSaving(true);
         setSaveMessage(null);
         setUploadProgress(0);
-        const file = directUploadFile;
+        const file = originalFile;
         const duration = await getFileDuration(file);
         const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(
           file, file.name, file.type || 'audio/mpeg', authUser.email, setUploadProgress
@@ -1960,7 +1980,7 @@ export default function App() {
           r2Url,
           transcriptionText: '',
           category: clipCategory || 'recording',
-          tags: ['audio-studio', 'direct-upload'],
+          tags: directUploadFile ? ['audio-studio', 'direct-upload'] : ['audio-studio', 'full-audio', 'original-file'],
           audioFormat: (file.name.split('.').pop() || 'mp3').toLowerCase(),
           aiService: 'none',
           aiModel: 'none',
@@ -2011,7 +2031,7 @@ export default function App() {
       let wavBlob: Blob;
       let saveDuration: number;
 
-      if (activeRegion) {
+      if (useRegion && activeRegion) {
         // Extract clip from selected region
         const startSample = Math.floor(activeRegion.start * audioBuffer.sampleRate);
         const endSample = Math.floor(activeRegion.end * audioBuffer.sampleRate);
@@ -2056,24 +2076,24 @@ export default function App() {
 
       // Upload WAV to R2 — chunked so it lands in the founder's own bucket when configured
       // (vegvisr_org.config) without hitting the per-request body size limit on large files.
-      const fileName = `${activeRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
+      const fileName = `${useRegion ? 'clip' : 'audio'}-${Date.now()}.wav`;
       const { r2Key, audioUrl: r2Url } = await uploadAudioToR2Chunked(wavBlob, fileName, 'audio/wav', authUser.email, setUploadProgress);
 
       // Save metadata to portfolio
-      const tags = [activeRegion ? 'clip' : 'full-audio', 'audio-studio'];
+      const tags = [useRegion ? 'clip' : 'full-audio', 'audio-studio'];
       if (track2Url) tags.push('mixed-2-tracks');
-      if (loadedRecordingId) tags.push(`${activeRegion ? 'clipped' : 'saved'}-from:${loadedRecordingId}`);
+      if (loadedRecordingId) tags.push(`${useRegion ? 'clipped' : 'saved'}-from:${loadedRecordingId}`);
 
       const recordingData = {
         userEmail: authUser.email,
         fileName,
-        displayName: clipName || (activeRegion ? `Clip of ${loadedRecordingName || 'Untitled'}` : loadedRecordingName || 'Untitled'),
+        displayName: clipName || (useRegion ? `Clip of ${loadedRecordingName || 'Untitled'}` : loadedRecordingName || 'Untitled'),
         fileSize: wavBlob.size,
         duration: Math.round(saveDuration),
         r2Key,
         r2Url,
         transcriptionText: '',
-        category: clipCategory || (activeRegion ? 'clip' : 'recording'),
+        category: clipCategory || (useRegion ? 'clip' : 'recording'),
         tags,
         audioFormat: 'wav',
         aiService: 'none',
@@ -2092,7 +2112,7 @@ export default function App() {
       if (!metaRes.ok) throw new Error(`Save failed: ${metaRes.status}`);
 
       setShowSaveDialog(false);
-      setSaveMessage(activeRegion ? 'Clip saved to portfolio!' : 'Audio saved to portfolio!');
+      setSaveMessage(useRegion ? 'Clip saved to portfolio!' : 'Audio saved to portfolio!');
       setTimeout(() => setSaveMessage(null), 3000);
     } catch (err) {
       console.error('Save to portfolio error:', err);
@@ -2233,9 +2253,28 @@ export default function App() {
                 onClick={(e) => e.stopPropagation()}
               >
                 <h3 className="text-lg font-bold mb-4">
-                  {directUploadFile ? 'Upload File to Portfolio' : `Save ${activeRegion ? 'Clip' : 'Audio'} to Portfolio`}
+                  {directUploadFile ? 'Upload File to Portfolio' : `Save ${activeRegion && saveScope === 'region' ? 'Region' : 'Whole Clip'} to Portfolio`}
                 </h3>
                 <div className="space-y-3 mb-5">
+                  {!directUploadFile && activeRegion && (
+                    <div className="grid grid-cols-2 gap-1 p-1 bg-zinc-100 rounded-lg" role="radiogroup" aria-label="What to save">
+                      {(['region', 'full'] as const).map((scope) => (
+                        <button
+                          key={scope}
+                          type="button"
+                          role="radio"
+                          aria-checked={saveScope === scope}
+                          disabled={isSaving}
+                          onClick={() => applySaveScope(scope)}
+                          className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                            saveScope === scope ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-700'
+                          }`}
+                        >
+                          {scope === 'region' ? 'Selected region' : 'Whole clip'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <div>
                     <label className="block text-xs font-semibold uppercase tracking-wider text-zinc-400 mb-1">Name</label>
                     <input
@@ -2260,13 +2299,16 @@ export default function App() {
                     <p className="text-xs text-zinc-400">
                       {directUploadFile.name} &mdash; {(directUploadFile.size / (1024 * 1024)).toFixed(1)} MB, uploaded as-is (no re-encoding)
                     </p>
-                  ) : activeRegion ? (
+                  ) : activeRegion && saveScope === 'region' ? (
                     <p className="text-xs text-zinc-400">
                       Region: {Math.floor(activeRegion.start / 60)}:{(activeRegion.start % 60).toFixed(1).padStart(4, '0')} &ndash; {Math.floor(activeRegion.end / 60)}:{(activeRegion.end % 60).toFixed(1).padStart(4, '0')} ({(activeRegion.end - activeRegion.start).toFixed(1)}s)
                     </p>
                   ) : (
                     <p className="text-xs text-zinc-400">
-                      Full audio &mdash; {Math.floor(duration / 60)}:{(duration % 60).toFixed(1).padStart(4, '0')} ({duration.toFixed(1)}s)
+                      Whole clip &mdash; {Math.floor(duration / 60)}:{(duration % 60).toFixed(1).padStart(4, '0')} ({duration.toFixed(1)}s)
+                      {canSaveOriginalFile
+                        ? <> &middot; original file uploaded as-is ({(sourceFile!.file.size / (1024 * 1024)).toFixed(1)} MB, no re-encoding)</>
+                        : <> &middot; saved as WAV{track2Url ? ' (mixed with overlay track)' : ''}</>}
                     </p>
                   )}
                   {isSaving && uploadProgress !== null && (
@@ -2520,22 +2562,24 @@ export default function App() {
                     onPlayRegion={playRegion}
                     onManualChange={handleRegionManualChange}
                     onDownload={downloadClip}
-                    onSaveToPortfolio={openSaveDialog}
+                    onSaveToPortfolio={() => openSaveDialog('region')}
                     onCutRegion={cutRegion}
                     onClear={clearRegion}
                     onAdd={addRegion}
                   />
-                  {/* Save full audio to portfolio (shown when no clip region is active) */}
-                  {authStatus === 'authed' && !activeRegion && (
+                  {/* Save the whole clip to portfolio — available with or without a region selected */}
+                  {authStatus === 'authed' && (
                     <button
                       type="button"
-                      onClick={openSaveDialog}
+                      onClick={() => openSaveDialog('full')}
                       disabled={isSaving}
-                      className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                      title="Save full audio to your Vegvisr audio portfolio"
+                      className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed ${
+                        activeRegion ? 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100' : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                      }`}
+                      title="Save the whole clip to your Vegvisr audio portfolio"
                     >
                       {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                      {isSaving ? 'Saving...' : 'Save to Portfolio'}
+                      {isSaving ? 'Saving...' : activeRegion ? 'Save Whole Clip' : 'Save to Portfolio'}
                     </button>
                   )}
                 </div>
