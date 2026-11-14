@@ -235,8 +235,11 @@ const fetchAudio = async (url: string): Promise<Response> => {
 type SortKey = 'name' | 'date' | 'duration';
 type SummaryStage = 'transcribing' | 'summarizing' | null;
 
-const PortfolioBrowser = ({ email, onSelect }: {
+const PortfolioBrowser = ({ email, token, onSelect }: {
   email: string;
+  // emailVerificationToken — audio-portfolio-worker requires it as X-API-Token on every
+  // per-user route (list/get/update/delete/generate-summary) since 2026-11-14.
+  token: string;
   onSelect: (rec: PortfolioRecording) => void;
 }) => {
   const [recordings, setRecordings] = useState<PortfolioRecording[]>([]);
@@ -324,7 +327,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
           `${PORTFOLIO_API}/update-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
           {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-API-Token': token },
             body: JSON.stringify({ duration: Math.floor(seconds) }),
           }
         ).catch(() => { /* leave the DB stale; the next visit re-measures */ });
@@ -366,7 +369,9 @@ const PortfolioBrowser = ({ email, onSelect }: {
           userEmail: email, order: 'newest', fields: 'light',
           offset: String(offset), limit: String(limit),
         });
-        const res = await fetch(`${PORTFOLIO_API}/list-recordings?${params.toString()}`);
+        const res = await fetch(`${PORTFOLIO_API}/list-recordings?${params.toString()}`, {
+          headers: { 'X-API-Token': token },
+        });
         if (!res.ok) throw new Error('Failed to fetch recordings');
         return await res.json() as {
           recordings?: PortfolioRecording[]; total?: number; nextOffset?: number; hasMore?: boolean;
@@ -419,7 +424,8 @@ const PortfolioBrowser = ({ email, onSelect }: {
     const recordingId = rec.recordingId || rec.id;
     try {
       const res = await fetch(
-        `${PORTFOLIO_API}/get-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`
+        `${PORTFOLIO_API}/get-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
+        { headers: { 'X-API-Token': token } }
       );
       if (!res.ok) throw new Error('Failed to load transcript');
       const data = await res.json();
@@ -454,7 +460,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
     try {
       const res = await fetch(`${PORTFOLIO_API}/generate-summary`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-API-Token': token },
         body: JSON.stringify({ userEmail: email, recordingId }),
       });
       const data = await res.json();
@@ -491,7 +497,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
         `${PORTFOLIO_API}/update-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
         {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-API-Token': token },
           body: JSON.stringify({ displayName: editName.trim(), category: editCategory.trim(), tags }),
         }
       );
@@ -519,7 +525,7 @@ const PortfolioBrowser = ({ email, onSelect }: {
     try {
       const res = await fetch(
         `${PORTFOLIO_API}/delete-recording?userEmail=${encodeURIComponent(email)}&recordingId=${encodeURIComponent(recordingId)}`,
-        { method: 'DELETE' }
+        { method: 'DELETE', headers: { 'X-API-Token': token } }
       );
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.error || `Failed with status ${res.status}`);
@@ -2350,7 +2356,7 @@ export default function App() {
 
         <main className="grid gap-6">
         {activeTab === 'portfolio' && authUser ? (
-          <PortfolioBrowser email={authUser.email} onSelect={handlePortfolioSelect} />
+          <PortfolioBrowser email={authUser.email} token={authUser.emailVerificationToken || ''} onSelect={handlePortfolioSelect} />
         ) : (
           <>
           {/* Input Section */}
